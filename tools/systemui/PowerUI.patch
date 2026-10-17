@@ -1,0 +1,22 @@
+--- smali-out/com/android/systemui/power/PowerUI.smali
++++ smali-patched/com/android/systemui/power/PowerUI.smali
+@@ -793,6 +793,9 @@
+     .registers 5
+ 
+     .prologue
++    # zeny: окно «неверная зарядка» рисует приложение по extra invalid_charger
++    return-void
++
+     .line 371
+     const-string v2, "PowerUI"
+ 
+@@ -981,6 +984,9 @@
+ 
+     invoke-virtual {v6, v7}, Landroid/content/Context;->sendBroadcast(Landroid/content/Intent;)V
+ 
++    # zeny: карточку низкого заряда рисует приложение по этому broadcast
++    goto :goto_78
++
+     .line 274
+     iget-object v6, p0, Lcom/android/systemui/power/PowerUI;->mBatteryLevelTextView:Landroid/widget/TextView;
+ 
