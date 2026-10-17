@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape android:shape="rectangle">
+            <solid android:color="#F2F2F7"/>
+            <stroke android:width="1dp" android:color="#C7C7CC"/>
+        </shape>
+    </item>
+    <item android:id="@android:id/progress">
+        <clip>
+            <!-- 🚀 [유리 효과] 좌우는 각지게 두고, 세로 중앙에 밝은 하이라이트 띠만 둬서 둥근 유리 튜브처럼
+                 보이도록 합니다 (아래는 진하게, 중앙은 밝게, 위는 중간). -->
+            <shape android:shape="rectangle">
+                <gradient
+                    android:angle="90"
+                    android:startColor="#3D6DA8"
+                    android:centerColor="#8AB6E8"
+                    android:endColor="#4A7BC0"
+                    android:centerY="0.5"/>
+            </shape>
+        </clip>
+    </item>
+</layer-list>

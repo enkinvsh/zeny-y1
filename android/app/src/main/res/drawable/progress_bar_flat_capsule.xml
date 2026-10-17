@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Полоса-капсула для экрана загрузки: радиус больше половины высоты, Skia зажимает его до полной капсулы. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape android:shape="rectangle">
+            <corners android:radius="26dp"/>
+            <solid android:color="#2C3744"/>
+        </shape>
+    </item>
+    <item android:id="@android:id/progress">
+        <clip>
+            <shape android:shape="rectangle">
+                <corners android:radius="26dp"/>
+                <solid android:color="#00DB4D"/>
+            </shape>
+        </clip>
+    </item>
+</layer-list>
