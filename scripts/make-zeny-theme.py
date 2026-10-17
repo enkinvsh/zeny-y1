@@ -31,6 +31,7 @@ SLABS = {
     "btn_now": "slab_now.png",
     "btn_music": "slab_music.png",
     "btn_videos": "slab_videos.png",
+    "btn_reader": "slab_reader.png",
     "btn_musicquiz": "slab_quiz.png",
     "btn_podcasts": "slab_podcasts.png",
     "btn_radio": "slab_radio.png",
@@ -74,6 +75,18 @@ def build_config():
             el["text_right_focused_color"] = ON_PRIMARY
             if el["id"] in SLABS:
                 el["preview_image"] = SLABS[el["id"]]
+    # Читалка встаёт сразу после видео, перед викториной. Пункта нет в базовой теме, поэтому берём за образец
+    # соседний (викторину) и сдвигаем номера фокуса всех, кто идёт дальше.
+    menu = cfg["main_menu"]
+    quiz = next(el for el in menu if el.get("id") == "btn_musicquiz")
+    reader = dict(quiz, id="btn_reader", text_normal="Reader", action="OPEN_READER")
+    at = menu.index(quiz)
+    for el in menu[at:]:
+        if el.get("type") == "button":
+            el["focus_index"] += 1
+    reader["focus_index"] = quiz["focus_index"] - 1
+    reader["preview_image"] = SLABS["btn_reader"]
+    menu.insert(at, reader)
     # Карточка кладётся поверх живой обложки той же площади; без preview_image (Now Playing) прозрачна.
     cfg["main_menu"].append({
         "id": "widget_slab",

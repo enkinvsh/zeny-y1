@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Стандартная подсветка фокуса API 26+ красит поверх кнопки прямоугольник с острыми углами и
+         бледнит скруглённую зелёную капсулу r26. На Y1 (API 17) её нет, она видна только на эмуляторе. -->
+    <style name="Theme.Y1" parent="android:Theme.Holo.NoActionBar">
+        <item name="android:defaultFocusHighlightEnabled">false</item>
+        <item name="android:dialogTheme">@style/Theme.Y1.Dialog</item>
+    </style>
+    <style name="Theme.Y1.Dialog" parent="android:Theme.Holo.Dialog">
+        <item name="android:defaultFocusHighlightEnabled">false</item>
+    </style>
+</resources>

@@ -28,3 +28,6 @@ theme/robots/_work_*/
 theme/robots/*_preview.png
 
 .DS_Store
+
+# Состояние оркестратора агентов
+.omo/

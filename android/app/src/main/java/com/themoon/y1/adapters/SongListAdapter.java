@@ -106,15 +106,14 @@ public class SongListAdapter extends BaseAdapter {
             // 📅 2. '최근 추가된 곡' 모드일 때
             // ==========================================
             else if ("RECENT".equals(MainActivity.instance.virtualQueryType)) {
+                // Порядок «новые сверху» уже говорит о свежести, поэтому у треков за сегодня и вчера
+                // подписи нет; дата остаётся только у более старых.
                 long lastMod = song.file.lastModified();
                 java.util.Calendar cal = java.util.Calendar.getInstance();
                 cal.set(java.util.Calendar.HOUR_OF_DAY, 0); cal.set(java.util.Calendar.MINUTE, 0); cal.set(java.util.Calendar.SECOND, 0); cal.set(java.util.Calendar.MILLISECOND, 0);
-                long todayStart = cal.getTimeInMillis();
-                long yesterdayStart = todayStart - (24 * 60 * 60 * 1000);
+                long yesterdayStart = cal.getTimeInMillis() - (24 * 60 * 60 * 1000);
                 String datePrefix = "";
-                if (lastMod >= todayStart) datePrefix = "[" + MainActivity.instance.t("Today") + "] ";
-                else if (lastMod >= yesterdayStart) datePrefix = "[" + MainActivity.instance.t("Yesterday") + "] ";
-                else {
+                if (lastMod < yesterdayStart) {
                     java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yy.MM.dd");
                     datePrefix = "[" + sdf.format(new java.util.Date(lastMod)) + "] ";
                 }

@@ -74,6 +74,24 @@
       "preview_image": "slab_videos.png"
     },
     {
+      "id": "btn_reader",
+      "type": "button",
+      "parent_id": "main_scroll_list",
+      "x": 0,
+      "y": 0,
+      "width": -1,
+      "height": 33,
+      "text_normal": "Reader",
+      "text_right": "›",
+      "text_right_color": "#FFA4A3A0",
+      "text_right_focused_color": "#FF08130B",
+      "action": "OPEN_READER",
+      "text_align": "left",
+      "text_size": 21,
+      "focus_index": 3,
+      "preview_image": "slab_reader.png"
+    },
+    {
       "id": "btn_musicquiz",
       "type": "button",
       "parent_id": "main_scroll_list",
@@ -88,7 +106,7 @@
       "action": "OPEN_MUSIC_QUIZ",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 3,
+      "focus_index": 4,
       "preview_image": "slab_quiz.png"
     },
     {
@@ -106,7 +124,7 @@
       "action": "OPEN_PODCASTS",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 4,
+      "focus_index": 5,
       "preview_image": "slab_podcasts.png"
     },
     {
@@ -124,7 +142,7 @@
       "action": "OPEN_RADIO",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 5,
+      "focus_index": 6,
       "preview_image": "slab_radio.png"
     },
     {
@@ -142,7 +160,7 @@
       "action": "OPEN_BLUETOOTH",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 6,
+      "focus_index": 7,
       "preview_image": "slab_bt.png"
     },
     {
@@ -160,7 +178,7 @@
       "action": "OPEN_WIFI",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 7,
+      "focus_index": 8,
       "preview_image": "slab_wifi.png"
     },
     {
@@ -178,7 +196,7 @@
       "action": "OPEN_SETTINGS",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 8,
+      "focus_index": 9,
       "preview_image": "slab_settings.png"
     },
     {
@@ -196,7 +214,7 @@
       "action": "OPEN_WEBSERVER",
       "text_align": "left",
       "text_size": 21,
-      "focus_index": 9,
+      "focus_index": 10,
       "preview_image": "slab_web.png"
     },
     {

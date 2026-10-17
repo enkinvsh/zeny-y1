@@ -3,7 +3,23 @@ package com.themoon.y1;
 import android.content.pm.PackageManager;
 import com.themoon.y1.views.ClassicMenuStyle;
 import com.themoon.y1.views.HeartDrawable;
+import com.themoon.y1.views.HugeGlyph;
+import com.themoon.y1.views.MarqueeTextView;
+import com.themoon.y1.views.PlayerProgressView;
+import com.themoon.y1.views.QuizSnippetBar;
+import com.themoon.y1.views.QuizView;
+import com.themoon.y1.views.BookListView;
+import com.themoon.y1.views.RsvpView;
+import com.themoon.y1.managers.LyricsDoc;
+import com.themoon.y1.managers.LyricsShift;
+import com.themoon.y1.managers.DeletedMarks;
+import com.themoon.y1.managers.TrackEraser;
+import com.themoon.y1.managers.SeekRamp;
+import com.themoon.y1.managers.SleepTimer;
+import com.themoon.y1.views.LyricsView;
 import com.themoon.y1.views.RoundedImageView;
+import com.themoon.y1.managers.QuizClipPlayer;
+import com.themoon.y1.managers.QuizGame;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -40,6 +56,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.os.Vibrator;
 import android.provider.Settings;
 import android.util.LruCache;
@@ -131,34 +148,27 @@ public class MainActivity extends Activity {
     private int backTargetForPlayer = STATE_BROWSER;
     private int backTargetForUtility = STATE_SETTINGS;
 
-    // 🚀 [신규 추가] Music Quiz 게임 상태 변수들
-    private List<SongItem> quizPool = new ArrayList<>();
-    private SongItem quizCorrectAnswer;
-    // 🚀 [문제 유형 다양화] 제목만 묻던 것에서 아티스트/앨범/연도/장르까지 - 라이브러리 메타데이터가
-    // 허락하는 만큼 매 문제마다 무작위로 유형을 고릅니다.
-    private static final int QUIZ_TYPE_TITLE = 0;
-    private static final int QUIZ_TYPE_ARTIST = 1;
-    private static final int QUIZ_TYPE_ALBUM = 2;
-    private static final int QUIZ_TYPE_YEAR = 3;
-    private static final int QUIZ_TYPE_GENRE = 4;
-    private static final int QUIZ_TYPE_ALBUM_COVER = 5; // 🚀 [신규] 텍스트 대신 앨범 커버 3장 중에서 고르는 시각형 문제
-    private int currentQuizType = QUIZ_TYPE_TITLE;
-    private String quizCorrectAnswerText; // 현재 문제 유형 기준 "정답 문자열"
-    private int quizScore = 0;
-    // 🚀 [Music Quiz 2 라운드 구조] 5개 라운드 x 8문제. 한 라운드를 다 풀면(=8문제 답변) 다음 라운드로 진행합니다.
-    // (목숨 3개는 게임 전체 공용 - 다 떨어지면 라운드 도중이라도 바로 게임 오버, 기존과 동일)
-    private static final int QUIZ_QUESTIONS_PER_ROUND = 8;
-    private static final int QUIZ_TOTAL_ROUNDS = 5;
-    private int quizRoundNumber = 1; // 1~5
-    private int quizQuestionInRound = 0; // 현재 라운드 안에서 몇 번째 문제인지 (0~8)
-    private int quizLives = 3;
-    private boolean quizAnswered = false;
+    // Угадай трек: правила в QuizGame, звук в QuizClipPlayer, здесь только экраны и клавиши.
+    private static final int QUIZ_SCREEN_START = 0;
+    private static final int QUIZ_SCREEN_ROUND = 1;
+    private static final int QUIZ_SCREEN_REVEAL = 2;
+    private static final int QUIZ_SCREEN_OVER = 3;
+    // Сколько держим подсветку верного/неверного ответа до экрана ответа: меньше 500 мс глаз не успевает
+    // заметить, какой ряд был правильным.
+    private static final int QUIZ_REVEAL_DELAY_MS = 650;
+    // Подряд не открывшихся файлов, после которых бросаем игру, чтобы не крутить битую библиотеку бесконечно.
+    private static final int QUIZ_MAX_LOAD_FAILS = 3;
+    private static final String PREF_QUIZ_BEST_SCORE = "quiz_best_score";
+    private static final String PREF_QUIZ_BEST_STREAK = "quiz_best_streak";
+    private QuizGame<SongItem> quizGame;
+    private QuizClipPlayer quizClip;
+    private int quizScreen = QUIZ_SCREEN_START;
+    // Пока подсвечиваем ответ, колесо и центр не должны дёргать фокус и второй раз отвечать.
+    private boolean quizInputLocked = false;
     private boolean quizWasPlayingBeforeStart = false;
-    private boolean quizGameOver = false;
-    private android.media.MediaPlayer quizPreviewPlayer;
-    private com.google.android.exoplayer2.SimpleExoPlayer quizExoPreview;
-    private android.os.CountDownTimer quizCountDownTimer;
-    private static final int QUIZ_QUESTION_TIME_MS = 10000;
+    private int quizLoadFails = 0;
+    private int quizBestScoreAtStart = 0;
+    private Runnable quizPendingReveal;
     // 🚀 [신규 추가] 가상 암전이 깨어날 때 가짜 클릭 이벤트가 터지는 것을 막아주는 방어막
     public boolean ignoreNextKeyUp = false;
     // 🚀 [신규 추가] 라디오 통제용 변수들
@@ -315,6 +325,10 @@ public class MainActivity extends Activity {
     // 💡 [추가] 오디오 스펙트럼 관련 변수들
     private android.media.audiofx.Visualizer audioVisualizer;
     private AudioVisualizerView visualizerView;
+    // Спектр плоской темы в правой колонке плеера; захват Visualizer включён, только пока он виден и играет музыка.
+    private AudioVisualizerView flatSpectrum;
+    private boolean spectrumRunning = false;
+    private boolean activityVisible = true;
     // 🚀 [신규 추가] LRC 가사 파서 및 UI 변수
     private ScrollView lyricScrollView;
     private TextView tvLyrics;
@@ -329,7 +343,30 @@ public class MainActivity extends Activity {
     private boolean isCenterButtonDown = false;
     private long centerButtonDownTime = 0;
 
+    // В плоской теме isVisualizerShowing значит «текст песни открыт на весь экран», в классических
+    // темах прежнее «показан крупный визуализатор или старое окно текста».
     private boolean isVisualizerShowing = false;
+    // Текст песни плоской темы: документ текущего трека (null, если текста нет) и два вью, строка
+    // под альбомом и полный экран. Старые поля выше остаются для классических тем и перемотки глав m4b.
+    private LyricsDoc lyricsDoc;
+    private String lyricsRawText;
+    private boolean lyricsAreChapters = false;
+    private boolean isLyricsFullscreenDefault = false;
+    private LyricsView lyricsSnippet;
+    private LyricsView lyricsFull;
+    private View layoutPlayerContent;
+    private final Handler lyricsHandler = new Handler();
+    private boolean lyricsTickScheduled = false;
+    // Ручной сдвиг синхронного текста текущего трека, мс: плюс сдвигает строки на позже, минус на раньше.
+    // Хранится в prefs под "lyrics_shift_" + путь трека; lyricsShiftSaved нужен, чтобы «Назад» вернул прежнее.
+    private int lyricsShiftMs = 0;
+    private int lyricsShiftSaved = 0;
+    private boolean lyricsSyncMode = false;
+    // Опережение на задержку отрисовки и аудио-буфера: строка должна появиться чуть раньше звука, а не позже.
+    private static final int LYRICS_LOOKAHEAD_MS = 150;
+    private static final int LYRICS_TICK_MS = 250;
+    // Простой текст ждёт в начале столько же, сколько прежний движок: вступление без слов.
+    private static final int LYRICS_PLAIN_DELAY_MS = 5000;
     public int currentAlbumColor = 0xFFFFFFFF; // 스펙트럼 바의 색상
     private static final int STATE_MENU = 1;
     private static final int STATE_BROWSER = 2;
@@ -345,6 +382,8 @@ public class MainActivity extends Activity {
     private static final int STATE_VIDEOS = 12;
     private static final int STATE_VIDEO_PLAYER = 13;
     private static final int STATE_USB = 14;
+    private static final int STATE_READER_LIST = 15;
+    private static final int STATE_READER = 16;
     // 💡 미디어 라이브러리 브라우저 상태 관리 변수들
     private static final int BROWSER_ROOT = 0;
     private static final int BROWSER_FOLDER = 1;
@@ -484,6 +523,8 @@ public class MainActivity extends Activity {
     private View layoutMainMenu, layoutBrowserMode, layoutSettingsMode;
     private View layoutBluetoothMode, layoutWifiMode, layoutWifiKeyboard;
     private View layoutMusicQuizMode;
+    private View layoutReaderMode;
+    private ReaderController readerController;
     private View layoutPlayerMode, layoutVolumeOverlay;
     private View layoutBrightnessMode, layoutStorageMode, layoutWebServerMode, layoutUsbMode;
     private com.themoon.y1.views.UsbPanel usbPanel;
@@ -518,10 +559,8 @@ public class MainActivity extends Activity {
     };
 
     private LinearLayout containerBrowserItems, containerSettingsItems;
-    // 🚀 [신규 추가] Music Quiz 게임 화면 전용 뷰들
-    private LinearLayout containerQuizItems;
-    private TextView tvQuizScore, tvQuizLives, tvQuizPrompt, tvQuizRound;
-    private ProgressBar pbQuizTimer;
+    private QuizView quizView;
+    private QuizSnippetBar quizSnippetBar;
     private LinearLayout containerBtItems, containerWifiItems;
 
     private TextView tvStatusClock, tvStatusBattery;
@@ -535,20 +574,42 @@ public class MainActivity extends Activity {
     private TextView tvQualityBitrate;
 
     public TextView tvPlayerTrackCount;
-    public TextView tvPlayerRating;
-    private ImageView ivPlayerShuffleStatus, ivPlayerRepeatStatus; // 💡 텍스트뷰에서 이미지뷰로 변경!
     public ProgressBar playerProgress;
 
-    // 🚀 [iPod 스타일] Now Playing 하단 바 4단계 순환 (0:Progress 1:Seek 2:Shuffle&Repeat 3:Rating)
-    private int nowPlayingBottomState = 0;
-    private int pendingSeekPosition;
-    private boolean pendingSeekChanged;
-    private View rowPlayerProgress, rowPlayerSeek, rowPlayerShuffleRepeat, rowPlayerRatingScrub, rowPlayerVolume;
+    private View rowPlayerProgress, rowPlayerVolume;
     private ProgressBar playerVolumeProgress;
-    private TextView tvPlayerSeekCurrent, tvPlayerSeekTotal;
-    private SeekBar seekPlayerScrub;
-    private TextView tvScrubShuffleValue, tvScrubRepeatValue;
-    private TextView[] tvScrubStars;
+    // Плоский плеер (тема Zeny): сердце и пауза поверх обложки, капсула прогресса и строка времени.
+    private ImageView ivCoverLike;
+    private HugeGlyph coverLikeGlyph;
+    private View viewCoverDim, layoutPlayerFlatBottom, rowPlayerFlatTimes;
+    private PlayerProgressView pvPlayerProgress;
+    private TextView tvFlatTimeElapsed, tvFlatTrackPos, tvFlatTimeLeft;
+    // Буферы времени переиспользуются: тик прогресса не должен ничего аллоцировать.
+    private final char[] elapsedChars = new char[8];
+    private final char[] remainingChars = new char[9];
+    private int shownElapsedSec = -1, shownRemainingSec = -1;
+    // Глифы режимов в строке состояния: видны, только пока режим включён.
+    private ImageView ivStatusShuffle, ivStatusRepeat;
+    private HugeGlyph statusShuffleGlyph, statusRepeatGlyph, statusRepeatOneGlyph;
+    // Луна таймера сна и минуты рядом: одна группа, чтобы отступ до соседнего глифа не зависел от числа.
+    private LinearLayout llStatusSleep;
+    private TextView tvStatusSleep;
+    private HugeGlyph statusSleepGlyph;
+    // Показанные в строке состояния минуты: подпись перерисовывается только при смене числа.
+    private int shownSleepMinutes = -1;
+    // Состояние таймера сна живёт только в памяти и не сбрасывается сменой экранов и гашением экрана.
+    private final SleepTimer sleepTimer = new SleepTimer();
+    private final Handler sleepHandler = new Handler();
+    // Один Runnable на всё время жизни: тик таймера не должен ничего аллоцировать.
+    private final Runnable sleepTick = new Runnable() {
+        @Override
+        public void run() {
+            onSleepTick();
+        }
+    };
+    // Удержание NEXT/PREV на экране плеера: цель копится здесь, звук прыгает при отпускании.
+    private boolean seekHoldPreview;
+    private int seekHoldTarget;
     private ProgressBar volumeProgress, pbBrightness, pbStorage;
     private TextView tvBrightnessVal, tvStorageDetails;
     // 💡 [수정] 수동 APP_VERSION 변수는 지우고 서버 폴더 주소만 적습니다.
@@ -559,7 +620,7 @@ public class MainActivity extends Activity {
     private Button btnServerToggle;
     // 🚀 [추가] 화면 전체를 덮는 고급 로딩 인디케이터 오버레이
     private LinearLayout layoutLoadingOverlay;
-    public ImageView ivMenuPreview, ivAlbumArt, ivAlbumReflection, ivPlayerBgBlur, ivPauseOverlay;
+    public ImageView ivMenuPreview, ivAlbumArt, ivAlbumReflection, ivPauseOverlay;
     // 🚀 [신규 엔진] 메인 메뉴 순서 변경(Reorder)을 위한 전역 변수들
     public boolean isMenuReorderMode = false;
     public View currentReorderRow = null;
@@ -727,19 +788,6 @@ public class MainActivity extends Activity {
             }
         }
     };
-    // 🚀 [추가] 글로벌 더블 클릭 및 루트 전원 제어용 변수 뱅크
-    private Handler doubleClickHandler = new Handler();
-    private long lastCenterUpTime = 0;
-    private Runnable singleClickRunnable = new Runnable() {
-        @Override
-        public void run() {
-            try {
-                handleCenterShortClick();
-            } catch (Exception e) {
-            }
-        }
-    };
-
     // 🚀 [추가] 긴 영어 문장을 씌우기 편하도록 짧은 번역 도구를 둡니다.
     public String t(String text) {
         return LanguageManager.getInstance(this).t(text);
@@ -825,6 +873,8 @@ public class MainActivity extends Activity {
     public void turnOffScreen() {
         if (inputLocked) return;
         inputLocked = true;
+        readerController.onScreenOff();
+        syncSpectrum();
         if (lockScreenNotice == null) {
             lockScreenNotice = buildLockScreen();
             ((ViewGroup) findViewById(android.R.id.content)).addView(lockScreenNotice,
@@ -833,7 +883,6 @@ public class MainActivity extends Activity {
         refreshLockScreenText();
         lockScreenNotice.setVisibility(View.VISIBLE);
         lockScreenNotice.bringToFront();
-        doubleClickHandler.removeCallbacks(singleClickRunnable);
         com.themoon.y1.managers.FmRadioManager fm = com.themoon.y1.managers.FmRadioManager.getInstance(this);
         // 🚀 [웹 서버 방어막] 라디오뿐만 아니라 서버가 돌아갈 때도 '가상 암전 모드'를 사용하여 CPU가 잠들지 않게 보호합니다!
         if (fm.isPowerUp || activePlayer == 1 || isServerRunning || currentScreenState == STATE_VIDEO_PLAYER) {
@@ -992,23 +1041,13 @@ public class MainActivity extends Activity {
                 if (am.isPlaying()) {
                     int current = am.getCurrentPosition();
                     int duration = am.getDuration();
-                    int progress = duration > 0 ? (int) (((float) current / duration) * 100) : 0;
-                    playerProgress.setProgress(progress);
-                    tvPlayerTimeCurrent.setText(formatTime(current));
-                    // 🚀 iPod Classic 스타일: 총 길이 대신 "남은 시간"을 음수(-)로 표시!
-                    tvPlayerTimeTotal.setText("-" + formatTime(Math.max(0, duration - current)));
-
-                    // 🚀 [iPod 스타일] Seek 상태(1번)일 때는 다이아몬드 탐색바도 같이 흘러가게 동기화!
-                    if (nowPlayingBottomState == 1 && !pendingSeekChanged && tvPlayerSeekCurrent != null) {
-                        pendingSeekPosition = current;
-                        tvPlayerSeekCurrent.setText(formatTime(current));
-                        tvPlayerSeekTotal.setText("-" + formatTime(Math.max(0, duration - current)));
-                        seekPlayerScrub.setMax(duration > 0 ? duration : 1000);
-                        seekPlayerScrub.setProgress(current);
-                    }
+                    // Пока держат NEXT/PREV, полоса показывает цель перемотки, а не играющую позицию.
+                    if (!seekHoldPreview) renderPlayerProgress(current, duration);
 
                     // 🚀 [신규 엔진] USLT 통짜 가사 비례 오토 스크롤 엔진! (전주 5초 대기 기능 탑재)
-                    if (isVisualizerShowing && plainLyrics != null && currentLyrics.isEmpty()) {
+                    // В плоской теме текст рисует LyricsView по собственному таймеру на 250 мс.
+                    if (!ThemeManager.isFlatTheme() && isVisualizerShowing && plainLyrics != null
+                            && currentLyrics.isEmpty()) {
                         int maxScroll = tvLyrics.getHeight() - lyricScrollView.getHeight();
 
                         if (maxScroll > 0 && duration > 0) {
@@ -1034,7 +1073,7 @@ public class MainActivity extends Activity {
                     }
 
                     // (기존 코드) 🚀 [가사 스크롤 엔진] 가사 모드가 켜져 있다면... (이하 유지)
-                    if (isVisualizerShowing && !currentLyrics.isEmpty()) {
+                    if (!ThemeManager.isFlatTheme() && isVisualizerShowing && !currentLyrics.isEmpty()) {
                         int currentKey = -1;
                         for (int i = 0; i < lyricTimestamps.size(); i++) {
                             if (current >= lyricTimestamps.get(i))
@@ -1100,9 +1139,7 @@ public class MainActivity extends Activity {
     private Runnable hideNowPlayingVolumeTask = new Runnable() {
         @Override
         public void run() {
-            if (rowPlayerVolume != null)
-                rowPlayerVolume.setVisibility(View.GONE);
-            updateNowPlayingBottomBarState();
+            hideNowPlayingVolume();
         }
     };
 
@@ -1898,6 +1935,7 @@ public class MainActivity extends Activity {
             isSoundCheckEnabled = prefs.getBoolean("sound_check_enabled", true);
             isZenyNaturalEnabled = prefs.getBoolean("zeny_natural_enabled", true);
             isAlbumTiltEnabled = prefs.getBoolean("album_tilt_enabled", false);
+            isLyricsFullscreenDefault = prefs.getBoolean("lyrics_fullscreen_default", false);
         } catch (Exception e) {
         }
         // 💡 [EQ 프리셋 목록 자동 로드] 기기가 지원하는 이퀄라이저 리스트를 가져옵니다.
@@ -2061,12 +2099,8 @@ public class MainActivity extends Activity {
         layoutSettingsMode = findViewById(R.id.layout_settings_mode);
         containerSettingsItems = findViewById(R.id.container_settings_items);
         layoutMusicQuizMode = findViewById(R.id.layout_music_quiz_mode);
-        containerQuizItems = findViewById(R.id.container_quiz_items);
-        tvQuizScore = findViewById(R.id.tv_quiz_score);
-        tvQuizLives = findViewById(R.id.tv_quiz_lives);
-        tvQuizPrompt = findViewById(R.id.tv_quiz_prompt);
-        tvQuizRound = findViewById(R.id.tv_quiz_round);
-        pbQuizTimer = findViewById(R.id.pb_quiz_timer);
+        bindQuizViews();
+        bindReaderViews();
         layoutBluetoothMode = findViewById(R.id.layout_bluetooth_mode);
         containerBtItems = findViewById(R.id.container_bt_items);
         btnScanBt = findViewById(R.id.btn_scan_bt);
@@ -2276,6 +2310,58 @@ public class MainActivity extends Activity {
         // 3. 우측 아이콘 그룹의 맨 앞(인덱스 0)에 쏙 끼워 넣습니다!
         rightStatusGroup.addView(ivStatusPlay, 0, playLp);
 
+        // Режимы перемешивания и повтора видны на любом экране слева от значка воспроизведения;
+        // шаг 26 px (глиф 18 + зазор 8), как в утверждённом макете.
+        float statusStroke = 1.6f * statusDensity;
+        statusShuffleGlyph = new HugeGlyph(HugeGlyph.SHUFFLE, ThemeManager.getTextColorPrimary(), statusStroke, false);
+        statusRepeatGlyph = new HugeGlyph(HugeGlyph.REPEAT, ThemeManager.getTextColorPrimary(), statusStroke, false);
+        statusRepeatOneGlyph = new HugeGlyph(HugeGlyph.REPEAT_ONE, ThemeManager.getTextColorPrimary(), statusStroke, false);
+        ivStatusShuffle = new ImageView(this);
+        ivStatusShuffle.setImageDrawable(statusShuffleGlyph);
+        ivStatusShuffle.setVisibility(View.GONE);
+        ivStatusRepeat = new ImageView(this);
+        ivStatusRepeat.setImageDrawable(statusRepeatGlyph);
+        ivStatusRepeat.setVisibility(View.GONE);
+        LinearLayout.LayoutParams shuffleLp = new LinearLayout.LayoutParams(
+                (int) (18 * statusDensity), (int) (18 * statusDensity));
+        shuffleLp.gravity = Gravity.CENTER_VERTICAL;
+        shuffleLp.setMargins(0, 0, (int) (8 * statusDensity), 0);
+        // Копирующий конструктор LayoutParams(LayoutParams) появился только в API 19, на Y1 (API 17)
+        // он даёт NoSuchMethodError при старте, поэтому параметры собираются заново.
+        LinearLayout.LayoutParams repeatLp = new LinearLayout.LayoutParams(
+                (int) (18 * statusDensity), (int) (18 * statusDensity));
+        repeatLp.gravity = Gravity.CENTER_VERTICAL;
+        repeatLp.setMargins(0, 0, (int) (8 * statusDensity), 0);
+        rightStatusGroup.addView(ivStatusShuffle, 0, shuffleLp);
+        rightStatusGroup.addView(ivStatusRepeat, 1, repeatLp);
+
+        statusSleepGlyph = new HugeGlyph(HugeGlyph.MOON, ThemeManager.getTextColorPrimary(), statusStroke, false);
+        ImageView ivStatusMoon = new ImageView(this);
+        ivStatusMoon.setImageDrawable(statusSleepGlyph);
+        tvStatusSleep = new TextView(this);
+        tvStatusSleep.setTextSize(12f);
+        tvStatusSleep.setTypeface(ThemeManager.getCustomFontBold());
+        tvStatusSleep.setTextColor(ThemeManager.getTextColorPrimary());
+        tvStatusSleep.setVisibility(View.GONE);
+        llStatusSleep = new LinearLayout(this);
+        llStatusSleep.setOrientation(LinearLayout.HORIZONTAL);
+        llStatusSleep.setGravity(Gravity.CENTER_VERTICAL);
+        llStatusSleep.setVisibility(View.GONE);
+        LinearLayout.LayoutParams moonLp = new LinearLayout.LayoutParams(
+                (int) (18 * statusDensity), (int) (18 * statusDensity));
+        moonLp.gravity = Gravity.CENTER_VERTICAL;
+        LinearLayout.LayoutParams minutesLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        minutesLp.gravity = Gravity.CENTER_VERTICAL;
+        minutesLp.setMargins((int) (2 * statusDensity), 0, 0, 0);
+        llStatusSleep.addView(ivStatusMoon, moonLp);
+        llStatusSleep.addView(tvStatusSleep, minutesLp);
+        LinearLayout.LayoutParams sleepLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sleepLp.gravity = Gravity.CENTER_VERTICAL;
+        sleepLp.setMargins(0, 0, (int) (8 * statusDensity), 0);
+        rightStatusGroup.addView(llStatusSleep, 2, sleepLp);
+
         // 🚀 [신규 추가] 웹 서버 아이콘도 똑같이 22dp 크기로 빚어서 상태바 우측 그룹에 꽂아 넣습니다!
         ivStatusServer = new ImageView(this);
 
@@ -2348,37 +2434,33 @@ public class MainActivity extends Activity {
             frameAlbumReflection.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         }
         applyAlbumTiltSetting();
-        ivPlayerBgBlur = findViewById(R.id.iv_player_bg_blur);
-        ivPlayerBgBlur.setScaleX(1.05f);
-        ivPlayerBgBlur.setScaleY(1.05f);
         ivPauseOverlay = findViewById(R.id.iv_pause_overlay);
         playerProgress = findViewById(R.id.player_progress); // 💖 프로그레시브바 완벽 노출 보호
         tvPlayerTrackCount = findViewById(R.id.tv_player_track_count);
-        tvPlayerRating = findViewById(R.id.tv_player_rating);
 
-        ivPlayerShuffleStatus = findViewById(R.id.iv_player_shuffle_status);
-        ivPlayerRepeatStatus = findViewById(R.id.iv_player_repeat_status);
-
-        // 🚀 [iPod 스타일] Now Playing 하단 바 4단계 순환 위젯 바인딩
         rowPlayerProgress = findViewById(R.id.row_player_progress);
         rowPlayerVolume = findViewById(R.id.row_player_volume);
         playerVolumeProgress = findViewById(R.id.player_volume_progress);
         if (playerVolumeProgress != null) {
             playerVolumeProgress.setMax(audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
         }
-        rowPlayerSeek = findViewById(R.id.row_player_seek);
-        rowPlayerShuffleRepeat = findViewById(R.id.row_player_shuffle_repeat);
-        rowPlayerRatingScrub = findViewById(R.id.row_player_rating_scrub);
-        tvPlayerSeekCurrent = findViewById(R.id.tv_player_seek_current);
-        tvPlayerSeekTotal = findViewById(R.id.tv_player_seek_total);
-        seekPlayerScrub = findViewById(R.id.seek_player_scrub);
-        tvScrubShuffleValue = findViewById(R.id.tv_scrub_shuffle_value);
-        tvScrubRepeatValue = findViewById(R.id.tv_scrub_repeat_value);
-        tvScrubStars = new TextView[]{
-                findViewById(R.id.tv_scrub_star_1), findViewById(R.id.tv_scrub_star_2),
-                findViewById(R.id.tv_scrub_star_3), findViewById(R.id.tv_scrub_star_4),
-                findViewById(R.id.tv_scrub_star_5)
-        };
+        ivCoverLike = findViewById(R.id.iv_cover_like);
+        flatSpectrum = findViewById(R.id.view_flat_spectrum);
+        lyricsSnippet = findViewById(R.id.view_lyrics_snippet);
+        lyricsFull = findViewById(R.id.view_lyrics_full);
+        layoutPlayerContent = findViewById(R.id.layout_player_content);
+        if (lyricsSnippet != null) lyricsSnippet.setMode(LyricsView.MODE_SNIPPET);
+        if (lyricsFull != null) lyricsFull.setMode(LyricsView.MODE_FULL_SYNCED);
+        applyLyricsTypefaces();
+        coverLikeGlyph = new HugeGlyph(HugeGlyph.HEART, ThemeManager.getTextColorPrimary());
+        ivCoverLike.setImageDrawable(coverLikeGlyph);
+        viewCoverDim = findViewById(R.id.view_cover_dim);
+        layoutPlayerFlatBottom = findViewById(R.id.layout_player_flat_bottom);
+        rowPlayerFlatTimes = findViewById(R.id.row_player_flat_times);
+        pvPlayerProgress = findViewById(R.id.pv_player_progress);
+        tvFlatTimeElapsed = findViewById(R.id.tv_flat_time_elapsed);
+        tvFlatTrackPos = findViewById(R.id.tv_flat_track_pos);
+        tvFlatTimeLeft = findViewById(R.id.tv_flat_time_left);
 
         // 🚀 순정 비주얼라이저 결합 프레임 유지
         FrameLayout albumContainer = (FrameLayout) ivAlbumArt.getParent();
@@ -2412,9 +2494,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.CENTER_HORIZONTAL));
         playerInnerLayout.addView(lyricScrollView, 0, visLp);
-        // 🚀 상위 상대 레이아웃(parentRel) 획득
-        LinearLayout statusIconsLayout = (LinearLayout) ivPlayerShuffleStatus.getParent();
-        RelativeLayout parentRel = (RelativeLayout) statusIconsLayout.getParent();
+        RelativeLayout parentRel = findViewById(R.id.layout_player_top);
 
         // 🚀 [핵심 수정] 앨범 이미지 내부가 아니라, 플레이어 화면 전체를 쓰는 parentRel 좌측 벽면에 알약을 정렬합니다!
 
@@ -2499,24 +2579,8 @@ public class MainActivity extends Activity {
 
         parentRel.addView(layoutAudioQualityContainer, containerLp);
 
-        // 🚀 기존에 정상 조립된 하트 및 우측 상단 아이콘 정렬 세트 유지 복원
-        LinearLayout verticalWrapper = new LinearLayout(this);
-        verticalWrapper.setOrientation(LinearLayout.VERTICAL);
-        verticalWrapper.setGravity(Gravity.RIGHT);
-
-        RelativeLayout.LayoutParams params = (RelativeLayout.LayoutParams) statusIconsLayout
-                .getLayoutParams();
-        parentRel.removeView(statusIconsLayout);
-
-        statusIconsLayout.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-        verticalWrapper.addView(statusIconsLayout);
-
-        // Сердце «в избранном» живёт в строке счётчика треков (iv_player_favorite в разметке).
+        // Сердце «в избранном» классических тем живёт в строке счётчика треков (iv_player_favorite в разметке).
         ivPlayerFavoriteStatus = findViewById(R.id.iv_player_favorite);
-
-        parentRel.addView(verticalWrapper, params);
 
         try {
             // 앱이 켜질 때 금고(SharedPreferences)에서 즐겨찾기 경로들을 싹 다 가져옵니다.
@@ -4025,6 +4089,8 @@ public class MainActivity extends Activity {
             }
 
             com.themoon.y1.views.PlayerSkin.apply(this);
+            applyLyricsTypefaces();
+            if (ThemeManager.isFlatTheme()) refreshFlatLyrics();
             styleScanButton(btnScanBt, btnScanBt != null && btnScanBt.hasFocus());
             styleScanButton(btnScanWifi, btnScanWifi != null && btnScanWifi.hasFocus());
             styleFlatBoxes();
@@ -4032,6 +4098,7 @@ public class MainActivity extends Activity {
                 ivStatusPlay.setColorFilter(ThemeManager.isFlatTheme()
                         ? (ThemeManager.getListButtonFocusedBg() | 0xFF000000) : 0xFF6194D1);
             }
+            applyPlayerGlyphColors();
 
             ViewGroup root = findViewById(android.R.id.content);
             applyFontToAllViews(root, ThemeManager.getCustomFont());
@@ -4654,6 +4721,8 @@ public class MainActivity extends Activity {
             title = t("Wi-Fi");
         } else if (currentScreenState == STATE_MUSIC_QUIZ) {
             title = t("Music Quiz");
+        } else if (currentScreenState == STATE_READER_LIST || currentScreenState == STATE_READER) {
+            title = t("Reader");
         } else if (currentScreenState == STATE_VIDEOS) {
             title = t("Videos");
         } else if (currentScreenState == STATE_MENU) {
@@ -4740,6 +4809,8 @@ public class MainActivity extends Activity {
     }
 
     public void changeScreen(int state) {
+        // Уход с плеера в подгонке текста (например, по таймеру или ссылке) не должен оставить режим висеть.
+        if (lyricsSyncMode && state != STATE_PLAYER) cancelLyricsSync();
         // 🚀 [경로 추적 엔진] 화면이 바뀌기 직전에, 내가 어디서 출발했는지 정확하게 백미러에 기록합니다!
         if (state == STATE_PLAYER) {
             if (currentScreenState == STATE_MENU || currentScreenState == STATE_BROWSER
@@ -4754,7 +4825,8 @@ public class MainActivity extends Activity {
                 }
             }
         } else if (state == STATE_BLUETOOTH || state == STATE_WIFI || state == STATE_BRIGHTNESS
-                || state == STATE_STORAGE || state == STATE_WEBSERVER || state == STATE_MUSIC_QUIZ) {
+                || state == STATE_STORAGE || state == STATE_WEBSERVER || state == STATE_MUSIC_QUIZ
+                || state == STATE_READER_LIST) {
             if (currentScreenState == STATE_MENU || currentScreenState == STATE_BROWSER
                     || currentScreenState == STATE_SETTINGS) {
                 backTargetForUtility = currentScreenState;
@@ -4785,6 +4857,16 @@ public class MainActivity extends Activity {
         layoutUsbMode.setVisibility(state == STATE_USB ? View.VISIBLE : View.GONE);
         if (state != STATE_USB && usbPanel != null) usbPanel.hide();
         layoutMusicQuizMode.setVisibility(state == STATE_MUSIC_QUIZ ? View.VISIBLE : View.GONE);
+        // Экран игры может закрыть не только «Назад» (например, переход по USB): отрывок не должен играть за кадром.
+        if (state != STATE_MUSIC_QUIZ) {
+            saveQuizRecords();
+            quizGame = null;
+            releaseQuizAudio();
+        }
+        layoutReaderMode.setVisibility(
+                state == STATE_READER_LIST || state == STATE_READER ? View.VISIBLE : View.GONE);
+        // Любой экран кроме читалки: позиции на карту, индекс книги из памяти.
+        if (state != STATE_READER_LIST && state != STATE_READER) readerController.leave();
         layoutVideosMode.setVisibility(state == STATE_VIDEOS ? View.VISIBLE : View.GONE);
         layoutVideoPlayerMode.setVisibility(state == STATE_VIDEO_PLAYER ? View.VISIBLE : View.GONE);
         if (state != STATE_VIDEO_PLAYER) {
@@ -4795,6 +4877,7 @@ public class MainActivity extends Activity {
             if (tvVideoModeHint != null) tvVideoModeHint.setVisibility(View.GONE);
         }
         layoutVolumeOverlay.setVisibility(View.GONE);
+        syncSpectrum();
 
         View statusBar = findViewById(R.id.layout_status_bar);
         if (statusBar != null) {
@@ -4886,26 +4969,175 @@ public class MainActivity extends Activity {
             usbPanel.focusTarget().requestFocus();
         } else if (state == STATE_MUSIC_QUIZ) {
             startMusicQuizSession();
+        } else if (state == STATE_READER_LIST) {
+            readerController.showLibrary();
+        } else if (state == STATE_READER) {
+            readerController.showReading();
         }
     }
 
-    // =======================================================
-    // 🚀 [신규 기능] Music Quiz - 클래식 iPod의 "Music Quiz" 게임을 우리 라이브러리로 재현!
-    // 무작위 곡을 짧게 재생하고, 4지선다로 제목을 맞추는 게임. 목숨 3개, 시간제한 있음.
-    // =======================================================
-    private void startMusicQuizSession() {
-        quizScore = 0;
-        quizRoundNumber = 1;
-        quizQuestionInRound = 0;
-        quizLives = 3;
-        quizGameOver = false;
-        quizWasPlayingBeforeStart = com.themoon.y1.managers.AudioPlayerManager.getInstance().isPlaying();
-        if (quizWasPlayingBeforeStart) {
-            com.themoon.y1.managers.AudioPlayerManager.getInstance().playOrPauseMusic(); // 게임 도중엔 원곡 재생 일시정지!
+    private void bindReaderViews() {
+        layoutReaderMode = findViewById(R.id.layout_reader_mode);
+        readerController = new ReaderController(new ReaderController.Host() {
+            @Override
+            public String t(String key) {
+                return MainActivity.this.t(key);
+            }
+
+            @Override
+            public void click() {
+                clickFeedback();
+            }
+
+            @Override
+            public void toast(String text) {
+                Y1Toast.makeText(MainActivity.this, text, Toast.LENGTH_SHORT).show();
+            }
+
+            @Override
+            public void goTo(boolean reading) {
+                changeScreen(reading ? STATE_READER : STATE_READER_LIST);
+            }
+
+            @Override
+            public void leave() {
+                changeScreen(backTargetForUtility);
+            }
+
+            @Override
+            public void keepAwake() {
+                resetBacklightTimer();
+            }
+
+            @Override
+            public void showMenu(String[] labels, int focusIndex, ReaderController.MenuListener listener) {
+                showReaderChoiceMenu(labels, focusIndex, listener);
+            }
+        }, prefs, (BookListView) findViewById(R.id.reader_book_list), (RsvpView) findViewById(R.id.reader_rsvp));
+    }
+
+    /**
+     * Список выбора для читалки (оглавление, закладки, скорость, меню книги). Тот же диалог, что у меню
+     * проигрывателя: открывается при зажатом PLAY, поэтому сам глотает медиаклавиши, иначе отпускание
+     * PLAY переключило бы музыку.
+     */
+    private void showReaderChoiceMenu(String[] labels, int focusIndex, final ReaderController.MenuListener listener) {
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setBackgroundColor(0xFFFFFFFF);
+        final LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        scrollView.addView(layout);
+
+        View.OnKeyListener wheel = new View.OnKeyListener() {
+            @Override
+            public boolean onKey(View v, int keyCode, KeyEvent event) {
+                if (event.getAction() != KeyEvent.ACTION_DOWN || (keyCode != 21 && keyCode != 22)) return false;
+                int step = keyCode == 21 ? -1 : 1;
+                int next = layout.indexOfChild(v) + step;
+                if (next >= 0 && next < layout.getChildCount()) {
+                    layout.getChildAt(next).requestFocus();
+                    clickFeedback();
+                }
+                return true;
+            }
+        };
+
+        final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setView(scrollView)
+                .create();
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        styleDialogCard(dialog, scrollView, layout);
+
+        for (int i = 0; i < labels.length; i++) {
+            final int pos = i;
+            View row = createListButtonWithIcon("", labels[i]);
+            row.setOnKeyListener(wheel);
+            row.setOnClickListener(v -> {
+                clickFeedback();
+                dialog.dismiss();
+                listener.onPick(pos);
+            });
+            layout.addView(row);
         }
 
-        // Opus/FLAC/OGG системный MediaPlayer Android 4.2 не играет надёжно (Opus нет вовсе), поэтому их
-        // отрывок играет отдельный лёгкий ExoPlayer (startQuizExoPreview); в пул идёт вся музыка.
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            boolean mediaKey = keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY || keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_STOP || keyCode == KeyEvent.KEYCODE_HEADSETHOOK;
+            if (!mediaKey) return false;
+            if (event.getAction() == KeyEvent.ACTION_UP) {
+                isBottomButtonDown = false;
+                isMediaLongPressConsumed = false;
+            }
+            return true;
+        });
+
+        dialog.show();
+        final int focus = Math.max(0, Math.min(focusIndex, labels.length - 1));
+        layout.postDelayed(() -> {
+            View target = layout.getChildAt(focus);
+            if (target != null) target.requestFocus();
+        }, 50);
+    }
+
+    // =======================================================
+    // Угадай трек: отрывок от 1 до 15 с, четыре варианта, три жизни, серия даёт множитель.
+    // Правила в QuizGame, звук в QuizClipPlayer, экраны рисует QuizView, шкалу QuizSnippetBar;
+    // здесь только связка и клавиши.
+    // =======================================================
+    private final QuizGame.Tags<SongItem> quizTags = new QuizGame.Tags<SongItem>() {
+        @Override
+        public String title(SongItem s) {
+            return s.title;
+        }
+
+        @Override
+        public String artist(SongItem s) {
+            return s.artist;
+        }
+
+        @Override
+        public String genre(SongItem s) {
+            // SongItem подставляет «Unknown Genre» вместо пустого тега; для подбора соперников это не жанр.
+            return "Unknown Genre".equals(s.genre) ? "" : s.genre;
+        }
+    };
+    private final java.util.Random quizRandom = new java.util.Random();
+    private final List<SongItem> quizPool = new ArrayList<>();
+    private List<SongItem> quizOptions;
+
+    private void bindQuizViews() {
+        quizView = findViewById(R.id.quiz_view);
+        quizSnippetBar = findViewById(R.id.quiz_snippet_bar);
+        quizView.setListener((screen, index) -> onQuizActivate(screen, index));
+        quizSnippetBar.setSource(new QuizSnippetBar.Source() {
+            @Override
+            public boolean isPlaying() {
+                return quizClip != null && quizClip.isPlaying();
+            }
+
+            @Override
+            public long positionInClipMs() {
+                return quizClip != null ? quizClip.getPositionInClipMs() : 0;
+            }
+        });
+    }
+
+    /**
+     * Шрифты берутся у текущей темы при каждом входе (её можно сменить между партиями), цвета фиксированы
+     * в QuizView: у светлых тем основной цвет текста тёмный и на поле ink пропал бы.
+     */
+    private void applyQuizFonts() {
+        quizView.setTypefaces(ThemeManager.getCustomFontTitle(), ThemeManager.getCustomFontBold(),
+                ThemeManager.getCustomFont());
+    }
+
+    private void startMusicQuizSession() {
+        quizWasPlayingBeforeStart = com.themoon.y1.managers.AudioPlayerManager.getInstance().isPlaying();
+        if (quizWasPlayingBeforeStart) {
+            com.themoon.y1.managers.AudioPlayerManager.getInstance().playOrPauseMusic();
+        }
+
         quizPool.clear();
         for (SongItem song : customLibrary) {
             String path = song.file.getAbsolutePath();
@@ -4915,141 +5147,42 @@ public class MainActivity extends Activity {
                 continue;
             quizPool.add(song);
         }
-
-        if (quizPool.size() < 4) {
+        if (quizPool.size() < QuizGame.OPTIONS) {
             Y1Toast.makeText(this, t("Not enough songs in your library for Music Quiz."), Toast.LENGTH_LONG).show();
-            changeScreen(backTargetForUtility);
+            exitMusicQuiz();
             return;
         }
-
-        updateQuizScoreLivesUI();
-        loadNextQuizQuestion();
+        if (quizClip == null) quizClip = new QuizClipPlayer(this);
+        applyQuizFonts();
+        showQuizStart();
     }
 
-    private void updateQuizScoreLivesUI() {
-        if (tvQuizScore != null)
-            tvQuizScore.setText(String.format(Locale.US, "$%,d", quizScore * 100));
-        if (tvQuizRound != null)
-            tvQuizRound.setText(String.valueOf(quizQuestionInRound));
-        if (tvQuizLives != null) {
-            StringBuilder hearts = new StringBuilder();
-            for (int i = 0; i < 3; i++)
-                hearts.append(i < quizLives ? "♥ " : "♡ ");
-            tvQuizLives.setText(hearts.toString().trim());
-        }
+    /** Шкала отрывка нужна только в раунде; остальное переключает сам QuizView. */
+    private void showQuizScreen(int screen) {
+        quizScreen = screen;
+        quizSnippetBar.setVisibility(screen == QUIZ_SCREEN_ROUND ? View.VISIBLE : View.GONE);
     }
 
-    // 🚀 [원작 재현] 매 라운드 앨범 커버를 새로 불러옵니다 (퀴즈 후보 풀은 MediaMetadataRetriever가
-    // 안정적으로 다루는 포맷만 남겨뒀으므로 커스텀 FLAC/Opus 추출기는 필요 없습니다).
-    // 🚀 [원작 재현] 2000년대 "Fruitiger Aero" 느낌의 광택 있는 알약(pill) 모양 버튼 - 왼쪽에 선택
-    // 표시용 동그라미가 있고, 포커스를 받으면 파란 유리 광택 배경으로 바뀝니다.
-    private LinearLayout createQuizAnswerPill(String text) {
-        float d = getResources().getDisplayMetrics().density;
-        final LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setFocusable(true);
-        row.setClickable(true);
-        row.setSoundEffectsEnabled(false);
-        row.setBackgroundResource(R.drawable.quiz_answer_pill_normal);
-        int padH = (int) (16 * d);
-        int padV = (int) (8 * d);
-        row.setPadding(padH, padV, padH, padV);
-        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rowLp.setMargins(0, (int) (3 * d), 0, (int) (3 * d));
-        row.setLayoutParams(rowLp);
-
-        final View dot = new View(this);
-        int dotSize = (int) (14 * d);
-        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dotSize, dotSize);
-        dotLp.rightMargin = (int) (12 * d);
-        dot.setLayoutParams(dotLp);
-        dot.setBackgroundResource(R.drawable.quiz_dot_filled);
-        dot.setVisibility(View.INVISIBLE);
-
-        final TextView tvText = new TextView(this);
-        tvText.setText(text);
-        tvText.setTextSize(17f);
-        tvText.setTextColor(0xFF181E26);
-        tvText.setTypeface(ThemeManager.getCustomFontBold());
-        tvText.setSingleLine(true);
-        tvText.setEllipsize(android.text.TextUtils.TruncateAt.MARQUEE);
-        tvText.setMarqueeRepeatLimit(-1);
-        tvText.setHorizontalFadingEdgeEnabled(true);
-        tvText.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
-
-        row.addView(dot);
-        row.addView(tvText);
-
-        row.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            @Override
-            public void onFocusChange(View v, boolean hasFocus) {
-                if (hasFocus) {
-                    row.setBackgroundResource(R.drawable.quiz_answer_pill_focused);
-                    tvText.setTextColor(0xFF08130B);
-                    dot.setVisibility(View.VISIBLE);
-                    tvText.setSelected(true);
-                } else {
-                    row.setBackgroundResource(R.drawable.quiz_answer_pill_normal);
-                    tvText.setTextColor(0xFF181E26);
-                    dot.setVisibility(View.INVISIBLE);
-                    tvText.setSelected(false);
-                }
-            }
-        });
-        return row;
+    private void showQuizStart() {
+        quizView.showStart(t("Guess the track"), t("The shorter the snippet, the more points"),
+                t("Best score"), formatQuizNumber(prefs.getInt(PREF_QUIZ_BEST_SCORE, 0)),
+                t("Best streak"), String.valueOf(prefs.getInt(PREF_QUIZ_BEST_STREAK, 0)), t("Play"));
+        showQuizScreen(QUIZ_SCREEN_START);
     }
 
-    // 🚀 [시각형 문제 전용] 텍스트 알약 대신, 정사각형 앨범 커버 타일 - 포커스 시 파란 테두리로 강조됩니다.
-    private LinearLayout createQuizCoverOptionTile(File songFile) {
-        float d = getResources().getDisplayMetrics().density;
-        final LinearLayout tile = new LinearLayout(this);
-        tile.setOrientation(LinearLayout.VERTICAL);
-        tile.setGravity(Gravity.CENTER);
-        tile.setFocusable(true);
-        tile.setClickable(true);
-        tile.setSoundEffectsEnabled(false);
-        tile.setBackgroundResource(R.drawable.quiz_answer_pill_normal);
-        int pad = (int) (6 * d);
-        tile.setPadding(pad, pad, pad, pad);
-
-        LinearLayout.LayoutParams tileLp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f);
-        tileLp.setMargins((int) (4 * d), 0, (int) (4 * d), 0);
-        tile.setLayoutParams(tileLp);
-
-        final ImageView ivCover = new RoundedImageView(this);
-        ivCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        ivCover.setImageResource(R.drawable.default_album);
-        // В вертикальном LinearLayout вес растягивает только высоту, поэтому ширина должна быть MATCH_PARENT
-        LinearLayout.LayoutParams coverLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        ivCover.setLayoutParams(coverLp);
-        tile.addView(ivCover);
-
-        extractQuizCoverArt(songFile, new QuizCoverCallback() {
-            @Override
-            public void onCoverLoaded(Bitmap bmp) {
-                if (bmp != null) ivCover.setImageBitmap(bmp);
-            }
-        });
-
-        tile.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            @Override
-            public void onFocusChange(View v, boolean hasFocus) {
-                tile.setBackgroundResource(hasFocus ? R.drawable.quiz_answer_pill_focused : R.drawable.quiz_answer_pill_normal);
-            }
-        });
-        return tile;
+    private void startQuizRun() {
+        quizGame = new QuizGame<>(quizPool, quizTags, quizRandom);
+        quizBestScoreAtStart = prefs.getInt(PREF_QUIZ_BEST_SCORE, 0);
+        quizLoadFails = 0;
+        updateQuizHud();
+        nextQuizRound();
     }
 
     private interface QuizCoverCallback {
         void onCoverLoaded(Bitmap bmp);
     }
 
-    // 🚀 [재사용] 원래는 문제 카드의 커버 미리보기 전용이었지만, 이제 커버 선택형 문제(4번 유형)의
-    // 보기 타일들을 채우는 데도 그대로 재사용합니다.
+    // Обложка для экрана ответа; колбэк приходит в UI-поток и только пока открыта игра.
     private void extractQuizCoverArt(final File file, final QuizCoverCallback callback) {
         new Thread(new Runnable() {
             @Override
@@ -5108,492 +5241,219 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    // 🚀 [문제 유형별 필드 추출] 이 유형의 질문에서 정답/보기로 쓸 문자열을 곡에서 뽑아옵니다.
-    private String getQuizFieldValue(SongItem s, int type) {
-        switch (type) {
-            case QUIZ_TYPE_ARTIST: return s.artist;
-            case QUIZ_TYPE_ALBUM: case QUIZ_TYPE_ALBUM_COVER: return s.album;
-            case QUIZ_TYPE_YEAR: return s.year;
-            case QUIZ_TYPE_GENRE: return s.genre;
-            default: return s.title;
+    private void nextQuizRound() {
+        cancelQuizPendingReveal();
+        quizInputLocked = false;
+        final SongItem song = quizGame.nextTrack();
+        quizSnippetBar.reset();
+        quizOptions = quizGame.options();
+        String[] titles = new String[QuizGame.OPTIONS];
+        String[] artists = new String[QuizGame.OPTIONS];
+        for (int i = 0; i < QuizGame.OPTIONS; i++) {
+            titles[i] = quizOptions.get(i).title;
+            artists[i] = quizArtistText(quizOptions.get(i));
         }
-    }
+        quizView.showRound(titles, artists);
+        updateQuizRoundTexts();
+        showQuizScreen(QUIZ_SCREEN_ROUND);
 
-    // 🚀 [유효성 검사] "Unknown Artist" 같은 빈 태그는 문제/보기로 쓰기에 부적절하므로 걸러냅니다.
-    private boolean isValidQuizField(SongItem s, int type) {
-        if (type == QUIZ_TYPE_TITLE) return true; // quizPool 자체가 이미 제목 유효성을 보장합니다.
-        String v = getQuizFieldValue(s, type);
-        return v != null && !v.trim().isEmpty() && !v.trim().toLowerCase(Locale.US).startsWith("unknown");
-    }
-
-    // 🚀 이 유형으로 문제를 낼 만큼(4지선다에 충분할 만큼) 서로 다른 값이 라이브러리에 있는지 확인합니다.
-    private int countDistinctQuizField(int type) {
-        java.util.HashSet<String> distinct = new java.util.HashSet<>();
-        for (SongItem s : quizPool) {
-            if (isValidQuizField(s, type))
-                distinct.add(getQuizFieldValue(s, type).trim().toLowerCase(Locale.US));
-        }
-        return distinct.size();
-    }
-
-    private String getQuizPromptText(int type, SongItem song) {
-        String title = "“" + song.title + "”";
-        switch (type) {
-            case QUIZ_TYPE_ARTIST: return t("Which artist released") + " " + title + "?";
-            case QUIZ_TYPE_ALBUM: return t("Which album is") + " " + title + " " + t("from?");
-            case QUIZ_TYPE_YEAR: return t("What year was") + " " + title + " " + t("released?");
-            case QUIZ_TYPE_GENRE: return t("What genre is") + " " + title + "?";
-            case QUIZ_TYPE_ALBUM_COVER: return t("Which cover matches this song's album?");
-            default: return t("What song is playing?");
-        }
-    }
-
-    private void loadNextQuizQuestion() {
-        // 🚀 [라운드 완주 체크] 이번 라운드의 8문제를 다 풀었다면, 다음 문제를 내지 않고
-        // 마지막 라운드였으면 승리 화면을, 아니면 라운드 전환 화면을 띄웁니다!
-        if (quizQuestionInRound >= QUIZ_QUESTIONS_PER_ROUND) {
-            if (quizRoundNumber >= QUIZ_TOTAL_ROUNDS) {
-                showQuizVictory();
-            } else {
-                showRoundCompleteTransition();
+        quizClip.setDspSettings(isZenyNaturalEnabled, isSoundCheckEnabled);
+        quizClip.prepare(song.file, new QuizClipPlayer.Listener() {
+            @Override
+            public void onPrepared(long durationMs) {
+                quizLoadFails = 0;
+                quizClip.setStartMs(QuizGame.pickStartMs(durationMs, quizRandom));
             }
+
+            @Override
+            public void onClipEnded() {
+                if (quizScreen == QUIZ_SCREEN_ROUND) quizSnippetBar.fillOpenStages();
+            }
+
+            @Override
+            public void onError() {
+                // Битый или неподдерживаемый файл не должен стоить жизни: молча берём следующий.
+                if (currentScreenState != STATE_MUSIC_QUIZ || quizGame == null) return;
+                if (++quizLoadFails >= QUIZ_MAX_LOAD_FAILS) {
+                    Y1Toast.makeText(MainActivity.this, t("Could not play tracks for the quiz."), Toast.LENGTH_LONG).show();
+                    exitMusicQuiz();
+                    return;
+                }
+                if (quizScreen == QUIZ_SCREEN_ROUND && !quizGame.isResolved()) nextQuizRound();
+            }
+        });
+        playQuizStage();
+    }
+
+    private void playQuizStage() {
+        quizClip.playClip(QuizGame.stageMs(quizGame.stage()));
+        quizSnippetBar.onClipStarted();
+    }
+
+    /** Ряд «Не знаю» с подсказкой «ещё N с» (на последней ступени «Сдаюсь» без секунд) и очки на кону. */
+    private void updateQuizRoundTexts() {
+        int stage = quizGame.stage();
+        boolean last = quizGame.isLastStage();
+        quizView.setRoundInfo(last ? t("Give up") : t("Don't know"),
+                last ? null : String.format(Locale.getDefault(), t("more %d s"), QuizGame.stageMs(stage + 1) / 1000),
+                "+" + formatQuizNumber(quizGame.potentialPoints()));
+    }
+
+    /** Центр колеса на выбранном элементе текущего экрана. */
+    private void onQuizActivate(int screen, int index) {
+        if (quizGame == null && screen != QUIZ_SCREEN_START) return;
+        if (quizInputLocked) return;
+        if (screen == QUIZ_SCREEN_START || screen == QUIZ_SCREEN_OVER) {
+            clickFeedback();
+            startQuizRun();
+        } else if (screen == QUIZ_SCREEN_ROUND) {
+            if (index == QuizGame.OPTIONS) onQuizSkip();
+            else onQuizAnswerPicked(index);
+        } else if (screen == QUIZ_SCREEN_REVEAL) {
+            clickFeedback();
+            if (quizGame.isOver()) showQuizGameOver();
+            else nextQuizRound();
+        }
+    }
+
+    private String quizArtistText(SongItem s) {
+        if (s.artist == null || s.artist.trim().isEmpty() || "Unknown Artist".equals(s.artist))
+            return t("Unknown Artist");
+        return s.artist;
+    }
+
+    private void onQuizSkip() {
+        if (quizScreen != QUIZ_SCREEN_ROUND || quizInputLocked || quizGame.isResolved()) return;
+        clickFeedback();
+        if (quizGame.isLastStage()) {
+            resolveQuizRound(-1, quizGame.giveUp());
             return;
         }
-
-        quizAnswered = false;
-        quizQuestionInRound++;
-        updateQuizScoreLivesUI();
-
-        final java.util.Random rnd = new java.util.Random();
-
-        // 🚀 [문제 유형 랜덤 선택] 라이브러리에 4지선다를 채울 만큼 서로 다른 값이 있는 유형만 후보로 남깁니다.
-        // 제목(TITLE)은 quizPool 자체가 이미 보장하므로 항상 가능합니다.
-        List<Integer> availableTypes = new ArrayList<>();
-        availableTypes.add(QUIZ_TYPE_TITLE);
-        if (countDistinctQuizField(QUIZ_TYPE_ARTIST) >= 4) availableTypes.add(QUIZ_TYPE_ARTIST);
-        if (countDistinctQuizField(QUIZ_TYPE_ALBUM) >= 4) availableTypes.add(QUIZ_TYPE_ALBUM);
-        if (countDistinctQuizField(QUIZ_TYPE_YEAR) >= 4) availableTypes.add(QUIZ_TYPE_YEAR);
-        if (countDistinctQuizField(QUIZ_TYPE_GENRE) >= 4) availableTypes.add(QUIZ_TYPE_GENRE);
-        // 🚀 커버 선택형은 사진 3장만 있으면 되므로 기준을 3으로 살짝 낮춥니다.
-        if (countDistinctQuizField(QUIZ_TYPE_ALBUM_COVER) >= 3) availableTypes.add(QUIZ_TYPE_ALBUM_COVER);
-        currentQuizType = availableTypes.get(rnd.nextInt(availableTypes.size()));
-
-        // 이 유형에서 유효한 값을 가진 곡들만 후보 풀로 씁니다 (예: 연도 문제는 연도 태그가 있는 곡만).
-        List<SongItem> typePool = new ArrayList<>();
-        for (SongItem s : quizPool) {
-            if (isValidQuizField(s, currentQuizType)) typePool.add(s);
-        }
-        if (typePool.isEmpty()) typePool = quizPool; // 안전망
-
-        quizCorrectAnswer = typePool.get(rnd.nextInt(typePool.size()));
-        quizCorrectAnswerText = getQuizFieldValue(quizCorrectAnswer, currentQuizType);
-
-        if (tvQuizPrompt != null)
-            tvQuizPrompt.setText(getQuizPromptText(currentQuizType, quizCorrectAnswer));
-
-        containerQuizItems.removeAllViews();
-
-        if (currentQuizType == QUIZ_TYPE_ALBUM_COVER) {
-            // 🚀 [시각형 문제] 서로 다른 앨범 3장의 커버를 나란히 보여주고 고르게 합니다.
-            containerQuizItems.setOrientation(LinearLayout.HORIZONTAL);
-
-            java.util.LinkedHashMap<String, SongItem> albumReps = new java.util.LinkedHashMap<>();
-            for (SongItem s : typePool) {
-                String key = s.album.trim().toLowerCase(Locale.US);
-                if (!albumReps.containsKey(key)) albumReps.put(key, s);
-            }
-            // 정답 곡의 앨범은 반드시 대표로 뽑히도록 강제 등록!
-            albumReps.put(quizCorrectAnswer.album.trim().toLowerCase(Locale.US), quizCorrectAnswer);
-
-            List<SongItem> repList = new ArrayList<>(albumReps.values());
-            java.util.Collections.shuffle(repList);
-
-            final int COVER_OPTION_COUNT = 3;
-            List<SongItem> coverOptions = new ArrayList<>();
-            coverOptions.add(quizCorrectAnswer);
-            for (SongItem rep : repList) {
-                if (coverOptions.size() >= COVER_OPTION_COUNT) break;
-                boolean sameAlbum = false;
-                for (SongItem existing : coverOptions) {
-                    if (rep.album.equalsIgnoreCase(existing.album)) { sameAlbum = true; break; }
-                }
-                if (!sameAlbum) coverOptions.add(rep);
-            }
-            java.util.Collections.shuffle(coverOptions);
-
-            for (final SongItem coverSong : coverOptions) {
-                LinearLayout tile = createQuizCoverOptionTile(coverSong.file);
-                tile.setOnClickListener(new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        clickFeedback();
-                        onQuizAnswerSelected(coverSong.album);
-                    }
-                });
-                containerQuizItems.addView(tile);
-            }
-        } else {
-            containerQuizItems.setOrientation(LinearLayout.VERTICAL);
-
-            // 🚀 [실제 iPod 스타일] 4지선다 - 화면에 스크롤 없이 다 보이도록 5개에서 4개로 조정!
-            final int QUIZ_OPTION_COUNT = 4;
-            java.util.LinkedHashSet<String> options = new java.util.LinkedHashSet<>();
-            options.add(quizCorrectAnswerText);
-            int guard = 0;
-            while (options.size() < QUIZ_OPTION_COUNT && guard < 200) {
-                guard++;
-                SongItem candidate = typePool.get(rnd.nextInt(typePool.size()));
-                String candidateText = getQuizFieldValue(candidate, currentQuizType);
-                boolean dup = false;
-                for (String existing : options) {
-                    if (candidateText.equalsIgnoreCase(existing)) { dup = true; break; }
-                }
-                if (!dup)
-                    options.add(candidateText);
-            }
-            final List<String> optionList = new ArrayList<>(options);
-            // 라이브러리가 아주 작아서 서로 다른 값을 다 못 채웠다면, 남는 자리는 그냥 아무거나로 채웁니다 (극단적 예외 상황 대비).
-            while (optionList.size() < QUIZ_OPTION_COUNT && !typePool.isEmpty()) {
-                optionList.add(getQuizFieldValue(typePool.get(rnd.nextInt(typePool.size())), currentQuizType));
-            }
-            java.util.Collections.shuffle(optionList);
-
-            for (final String optionText : optionList) {
-                LinearLayout row = createQuizAnswerPill(optionText);
-                row.setOnClickListener(new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        clickFeedback();
-                        onQuizAnswerSelected(optionText);
-                    }
-                });
-                containerQuizItems.addView(row);
-            }
-        }
-        containerQuizItems.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (containerQuizItems.getChildCount() > 0)
-                    containerQuizItems.getChildAt(0).requestFocus();
-            }
-        }, 50);
-
-        startQuizPreviewPlayback(quizCorrectAnswer.file);
-        startQuizTimer();
+        quizGame.unlockNextStage();
+        quizSnippetBar.setStage(quizGame.stage());
+        updateQuizRoundTexts();
+        playQuizStage();
     }
 
-    private void startQuizTimer() {
-        cancelQuizTimer();
-        if (pbQuizTimer != null) {
-            pbQuizTimer.setMax(QUIZ_QUESTION_TIME_MS);
-            pbQuizTimer.setProgress(QUIZ_QUESTION_TIME_MS);
-        }
-        quizCountDownTimer = new android.os.CountDownTimer(QUIZ_QUESTION_TIME_MS, 100) {
-            @Override
-            public void onTick(long millisUntilFinished) {
-                if (pbQuizTimer != null)
-                    pbQuizTimer.setProgress((int) millisUntilFinished);
-            }
+    private void onQuizAnswerPicked(int index) {
+        if (quizScreen != QUIZ_SCREEN_ROUND || quizInputLocked) return;
+        QuizGame.Result r = quizGame.answer(quizOptions.get(index));
+        if (r == null) return;
+        clickFeedback();
+        resolveQuizRound(index, r);
+    }
 
-            @Override
-            public void onFinish() {
-                if (pbQuizTimer != null)
-                    pbQuizTimer.setProgress(0);
-                if (!quizAnswered)
-                    onQuizAnswerSelected(null); // ⏰ 시간 초과 = 오답 처리!
-            }
+    /** Подсветить верный (и неверно выбранный) ряд, затем показать экран ответа. */
+    private void resolveQuizRound(int pickedIndex, final QuizGame.Result r) {
+        quizInputLocked = true;
+        quizView.setLocked(true);
+        quizClip.stop();
+        SongItem answer = quizGame.current();
+        for (int i = 0; i < QuizGame.OPTIONS; i++) {
+            if (quizOptions.get(i) == answer) quizView.setRowState(i, QuizView.ROW_CORRECT);
+            else if (i == pickedIndex) quizView.setRowState(i, QuizView.ROW_WRONG);
+        }
+        updateQuizHud();
+        quizPendingReveal = () -> {
+            quizPendingReveal = null;
+            showQuizReveal(r);
         };
-        quizCountDownTimer.start();
+        quizView.postDelayed(quizPendingReveal, QUIZ_REVEAL_DELAY_MS);
     }
 
-    private void cancelQuizTimer() {
-        if (quizCountDownTimer != null) {
-            quizCountDownTimer.cancel();
-            quizCountDownTimer = null;
-        }
-    }
-
-    private static boolean needsExoPreview(File file) {
-        String name = file.getName().toLowerCase();
-        return name.endsWith(".opus") || name.endsWith(".flac") || name.endsWith(".ogg");
-    }
-
-    // Отрывок для викторины через ExoPlayer: тот же декодер libopus/flac, что и у основного плеера, но
-    // без очереди, эквалайзера и сессии эффектов. Основной плеер на время игры стоит на паузе.
-    private void startQuizExoPreview(final File file) {
-        try {
-            com.google.android.exoplayer2.DefaultRenderersFactory factory = new com.google.android.exoplayer2.DefaultRenderersFactory(
-                    getApplicationContext())
-                    .setExtensionRendererMode(
-                            com.google.android.exoplayer2.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER);
-            final com.google.android.exoplayer2.SimpleExoPlayer player = new com.google.android.exoplayer2.SimpleExoPlayer.Builder(
-                    getApplicationContext(), factory).build();
-            quizExoPreview = player;
-            player.setRepeatMode(com.google.android.exoplayer2.Player.REPEAT_MODE_ONE);
-            player.addListener(new com.google.android.exoplayer2.Player.EventListener() {
-                private boolean started;
-
-                @Override
-                public void onPlayerStateChanged(boolean playWhenReady, int playbackState) {
-                    if (started || playbackState != com.google.android.exoplayer2.Player.STATE_READY)
-                        return;
-                    started = true;
-                    long duration = player.getDuration();
-                    long start = 0;
-                    // Как и у MediaPlayer: на длинном треке берём кусок из середины, а не вступление.
-                    if (duration > 20000) {
-                        long maxStart = duration - 12000;
-                        start = (long) (maxStart * 0.2) + new java.util.Random().nextInt(Math.max(1, (int) (maxStart * 0.5)));
-                    }
-                    player.seekTo(start);
-                    player.setPlayWhenReady(true);
-                }
-            });
-            player.setMediaItem(com.google.android.exoplayer2.MediaItem.fromUri(android.net.Uri.fromFile(file)));
-            player.prepare();
-        } catch (Exception e) {
-            stopQuizPreviewPlayback();
+    private void cancelQuizPendingReveal() {
+        if (quizPendingReveal != null) {
+            quizView.removeCallbacks(quizPendingReveal);
+            quizPendingReveal = null;
         }
     }
 
-    private void startQuizPreviewPlayback(final File file) {
-        stopQuizPreviewPlayback();
-        if (needsExoPreview(file)) {
-            startQuizExoPreview(file);
-            return;
-        }
-        try {
-            quizPreviewPlayer = new android.media.MediaPlayer();
-            quizPreviewPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
-            quizPreviewPlayer.setDataSource(file.getAbsolutePath());
-            quizPreviewPlayer.setOnPreparedListener(new android.media.MediaPlayer.OnPreparedListener() {
-                @Override
-                public void onPrepared(android.media.MediaPlayer mp) {
-                    try {
-                        int duration = mp.getDuration();
-                        int start = 0;
-                        // 🚀 곡이 충분히 길면 도입부 대신 중간 즈음의 알아보기 쉬운 구간에서 시작!
-                        if (duration > 20000) {
-                            java.util.Random r = new java.util.Random();
-                            int maxStart = duration - 12000;
-                            start = (int) (maxStart * 0.2) + r.nextInt(Math.max(1, (int) (maxStart * 0.5)));
-                        }
-                        mp.seekTo(start);
-                        mp.start();
-                    } catch (Exception e) {
-                    }
-                }
-            });
-            quizPreviewPlayer.setOnCompletionListener(new android.media.MediaPlayer.OnCompletionListener() {
-                @Override
-                public void onCompletion(android.media.MediaPlayer mp) {
-                    // 🚀 짧은 곡이 시간제한보다 먼저 끝나면 처음부터 다시 (문제 시간이 끝날 때까지 계속 들려줍니다)
-                    try {
-                        mp.seekTo(0);
-                        mp.start();
-                    } catch (Exception e) {
-                    }
-                }
-            });
-            quizPreviewPlayer.prepareAsync();
-        } catch (Exception e) {
-        }
-    }
-
-    private void stopQuizPreviewPlayback() {
-        if (quizExoPreview != null) {
-            try {
-                quizExoPreview.release();
-            } catch (Exception e) {
-            }
-            quizExoPreview = null;
-        }
-        if (quizPreviewPlayer != null) {
-            try {
-                quizPreviewPlayer.stop();
-            } catch (Exception e) {
-            }
-            try {
-                quizPreviewPlayer.release();
-            } catch (Exception e) {
-            }
-            quizPreviewPlayer = null;
-        }
-    }
-
-    private void onQuizAnswerSelected(String selected) {
-        if (quizAnswered)
-            return;
-        quizAnswered = true;
-        cancelQuizTimer();
-        stopQuizPreviewPlayback();
-
-        boolean correct = selected != null && quizCorrectAnswerText != null
-                && selected.equalsIgnoreCase(quizCorrectAnswerText);
-
-        if (correct) {
-            quizScore++;
-            Y1Toast.makeText(this, "✅ " + t("Correct!"), Toast.LENGTH_SHORT).show();
-        } else {
-            quizLives--;
-            Y1Toast.makeText(this,
-                    "❌ " + t("It was: ") + (quizCorrectAnswerText != null ? quizCorrectAnswerText : ""),
-                    Toast.LENGTH_SHORT).show();
-        }
-        updateQuizScoreLivesUI();
-
-        new Handler().postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (currentScreenState != STATE_MUSIC_QUIZ)
-                    return; // 그 사이 화면을 나갔다면 아무것도 하지 않습니다.
-                if (quizLives <= 0) {
-                    showQuizGameOver();
-                } else {
-                    loadNextQuizQuestion();
-                }
-            }
-        }, 1200);
-    }
-
-    // 🚀 [Music Quiz 2] 8문제짜리 라운드를 목숨을 잃지 않고 다 풀었을 때 뜨는 전환 화면.
-    // (보너스 라운드는 다음 단계에서 추가 예정 - 지금은 라운드 사이의 체크포인트 역할만 합니다)
-    private void showRoundCompleteTransition() {
-        if (pbQuizTimer != null)
-            pbQuizTimer.setProgress(0);
-
-        if (tvQuizPrompt != null) {
-            tvQuizPrompt.setText(t("Round ") + quizRoundNumber + " " + t("Complete!"));
-        }
-        updateQuizScoreLivesUI();
-
-        containerQuizItems.setOrientation(LinearLayout.VERTICAL); // 🚀 직전 문제가 커버 선택형이었을 수도 있으니 방향 복구
-        containerQuizItems.removeAllViews();
-        LinearLayout btnContinue = createQuizAnswerPill(t("Continue"));
-        btnContinue.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                clickFeedback();
-                quizRoundNumber++;
-                quizQuestionInRound = 0;
-                loadNextQuizQuestion();
-            }
+    private void showQuizReveal(QuizGame.Result r) {
+        quizInputLocked = false;
+        final SongItem song = quizGame.current();
+        quizView.showReveal(r.correct, r.correct ? "+" + formatQuizNumber(r.points) : t("Miss"),
+                song.title, quizArtistText(song), quizGame.isOver() ? t("Results") : t("Next"));
+        quizView.setCover(ThemeManager.getCustomIcon("icon_default_album.png", this, R.drawable.default_album));
+        extractQuizCoverArt(song.file, bmp -> {
+            // Обложка грузится в фоне: к её приходу игрок мог уже уйти к следующему треку.
+            if (bmp != null && quizScreen == QUIZ_SCREEN_REVEAL && quizGame != null && quizGame.current() == song)
+                quizView.setCover(bmp);
         });
-        containerQuizItems.addView(btnContinue);
-
-        containerQuizItems.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (containerQuizItems.getChildCount() > 0)
-                    containerQuizItems.getChildAt(0).requestFocus();
-            }
-        }, 50);
-    }
-
-    // 🚀 [Music Quiz 2] 5라운드(40문제)를 전부 목숨 3개로 버텨냈을 때 뜨는 승리 화면 - Game Over와는 별개!
-    private void showQuizVictory() {
-        quizGameOver = true;
-        int highScore = prefs.getInt("quiz_high_score", 0);
-        boolean isNewHighScore = quizScore > highScore;
-        if (isNewHighScore) {
-            prefs.edit().putInt("quiz_high_score", quizScore).apply();
-            highScore = quizScore;
-        }
-
-        if (tvQuizPrompt != null) {
-            tvQuizPrompt.setText("🏆 " + t("You beat all 5 rounds!") + "\n"
-                    + (isNewHighScore ? t("New High Score!") : t("Best") + ": $" + (highScore * 100)));
-        }
-        if (pbQuizTimer != null)
-            pbQuizTimer.setProgress(0);
-        updateQuizScoreLivesUI();
-
-        containerQuizItems.setOrientation(LinearLayout.VERTICAL); // 🚀 직전 문제가 커버 선택형이었을 수도 있으니 방향 복구
-        containerQuizItems.removeAllViews();
-        LinearLayout btnAgain = createQuizAnswerPill(t("Play Again"));
-        btnAgain.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                clickFeedback();
-                startMusicQuizSession();
-            }
-        });
-        containerQuizItems.addView(btnAgain);
-
-        LinearLayout btnExit = createQuizAnswerPill(t("Exit"));
-        btnExit.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                clickFeedback();
-                exitMusicQuiz();
-            }
-        });
-        containerQuizItems.addView(btnExit);
-
-        containerQuizItems.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (containerQuizItems.getChildCount() > 0)
-                    containerQuizItems.getChildAt(0).requestFocus();
-            }
-        }, 50);
+        showQuizScreen(QUIZ_SCREEN_REVEAL);
+        quizClip.continuePlaying(QuizGame.REVEAL_CAP_MS);
     }
 
     private void showQuizGameOver() {
-        quizGameOver = true;
-        int highScore = prefs.getInt("quiz_high_score", 0);
-        boolean isNewHighScore = quizScore > highScore;
-        if (isNewHighScore) {
-            prefs.edit().putInt("quiz_high_score", quizScore).apply();
-            highScore = quizScore;
+        quizClip.release();
+        saveQuizRecords();
+        int score = quizGame.score();
+        // «Рекорд!» только у счёта; сравнение с рекордом на начало партии, а не с только что сохранённым.
+        boolean record = QuizGame.isRecord(score, quizBestScoreAtStart);
+        quizView.showOver(t("Game over"), t("Score"), formatQuizNumber(score),
+                t("Best streak"), String.valueOf(quizGame.bestStreak()), record ? t("Record!") : null, t("Play again"));
+        showQuizScreen(QUIZ_SCREEN_OVER);
+    }
+
+    /** Счёт без анимации счётчика: покадровая смена строки аллоцировала бы на каждом тике. */
+    private void updateQuizHud() {
+        int streak = quizGame.streak();
+        quizView.setHud(quizGame.lives(), formatQuizNumber(quizGame.score()), streak, QuizGame.multiplier(streak));
+    }
+
+    private String formatQuizNumber(int n) {
+        // Обычный пробел между тысячами («1 240»): в Unbounded SemiBold нет U+202F и U+00A0, на их месте
+        // рисуется пустая .notdef шириной 32 px при кегле 38 против 10 px у пробела.
+        return String.format(Locale.US, "%,d", n).replace(',', ' ');
+    }
+
+    private void saveQuizRecords() {
+        if (quizGame == null) return;
+        SharedPreferences.Editor e = prefs.edit();
+        if (QuizGame.isRecord(quizGame.score(), prefs.getInt(PREF_QUIZ_BEST_SCORE, 0)))
+            e.putInt(PREF_QUIZ_BEST_SCORE, quizGame.score());
+        if (QuizGame.isRecord(quizGame.bestStreak(), prefs.getInt(PREF_QUIZ_BEST_STREAK, 0)))
+            e.putInt(PREF_QUIZ_BEST_STREAK, quizGame.bestStreak());
+        e.apply();
+    }
+
+    /** Колесо по элементам текущего экрана игры, по кругу. */
+    private void moveQuizFocus(int dir) {
+        if (quizInputLocked) return;
+        if (quizView.moveSelection(dir)) clickFeedback();
+    }
+
+    /** Медиаклавиши во время игры: главный плеер они трогать не должны. */
+    private void onQuizMediaKey(int keyCode) {
+        if (quizGame == null || quizInputLocked) return;
+        if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT) {
+            if (quizScreen == QUIZ_SCREEN_ROUND) onQuizSkip();
+            else if (quizScreen == QUIZ_SCREEN_REVEAL) {
+                if (quizGame.isOver()) showQuizGameOver();
+                else nextQuizRound();
+            }
+        } else if (quizScreen == QUIZ_SCREEN_ROUND && !quizGame.isResolved()) {
+            playQuizStage();
+        } else if (quizScreen == QUIZ_SCREEN_REVEAL) {
+            if (quizClip.isPlaying()) quizClip.stop();
+            else quizClip.continuePlaying(QuizGame.REVEAL_CAP_MS);
         }
+    }
 
-        if (tvQuizPrompt != null) {
-            tvQuizPrompt.setText(t("Game Over!") + "\n"
-                    + (isNewHighScore ? "🏆 " + t("New High Score!") : t("Best") + ": $" + (highScore * 100)));
-        }
-        if (pbQuizTimer != null)
-            pbQuizTimer.setProgress(0);
-        updateQuizScoreLivesUI();
-
-        containerQuizItems.setOrientation(LinearLayout.VERTICAL); // 🚀 직전 문제가 커버 선택형이었을 수도 있으니 방향 복구
-        containerQuizItems.removeAllViews();
-        LinearLayout btnAgain = createQuizAnswerPill(t("Play Again"));
-        btnAgain.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                clickFeedback();
-                startMusicQuizSession();
-            }
-        });
-        containerQuizItems.addView(btnAgain);
-
-        LinearLayout btnExit = createQuizAnswerPill(t("Exit"));
-        btnExit.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                clickFeedback();
-                exitMusicQuiz();
-            }
-        });
-        containerQuizItems.addView(btnExit);
-
-        containerQuizItems.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (containerQuizItems.getChildCount() > 0)
-                    containerQuizItems.getChildAt(0).requestFocus();
-            }
-        }, 50);
+    private void releaseQuizAudio() {
+        if (quizView != null) cancelQuizPendingReveal();
+        quizInputLocked = false;
+        if (quizClip != null) quizClip.release();
     }
 
     private void exitMusicQuiz() {
-        cancelQuizTimer();
-        stopQuizPreviewPlayback();
+        saveQuizRecords();
+        releaseQuizAudio();
+        quizGame = null;
         if (quizWasPlayingBeforeStart) {
+            quizWasPlayingBeforeStart = false;
             com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
             if (!am.isPlaying())
-                am.playOrPauseMusic(); // 게임 시작 전에 재생 중이었다면 다시 이어서 재생!
+                am.playOrPauseMusic();
         }
         changeScreen(backTargetForUtility);
     }
@@ -5713,25 +5573,22 @@ public class MainActivity extends Activity {
         }
 
         if (currentScreenState == STATE_PLAYER) {
-            // 🚀 [iPod 스타일] Center 클릭 시 하단 바가 Progress→Seek→Shuffle&Repeat→Rating→Progress 순으로 순환!
-            com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
-            if (nowPlayingBottomState == 1 && pendingSeekChanged) {
-                am.seekRelative(pendingSeekPosition - am.getCurrentPosition());
-                pendingSeekChanged = false;
-                nowPlayingBottomState = 0;
-                int duration = am.getDuration();
-                tvPlayerTimeCurrent.setText(formatTime(pendingSeekPosition));
-                tvPlayerTimeTotal.setText("-" + formatTime(Math.max(0, duration - pendingSeekPosition)));
-                playerProgress.setProgress(duration > 0 ? (int) (100L * pendingSeekPosition / duration) : 0);
+            // Сердце под полноэкранным текстом скрыто, поэтому центр здесь закрывает текст, а не ставит лайк.
+            if (lyricsSyncMode) {
+                clickFeedback();
+                saveLyricsSync();
+            } else if (lyricsFullShown()) {
+                clickFeedback();
+                closeFullscreenLyrics();
             } else {
-                nowPlayingBottomState = (nowPlayingBottomState + 1) % 4;
-                if (nowPlayingBottomState == 1) {
-                    pendingSeekPosition = am.getCurrentPosition();
-                    pendingSeekChanged = false;
-                }
+                likeCurrentTrack();
             }
-            updateNowPlayingBottomBarState();
-            clickFeedback();
+        } else if (currentScreenState == STATE_MUSIC_QUIZ) {
+            // Центр гасится в handleCenterGesture и до onKeyDown не доходит; QuizView не берёт фокус, поэтому
+            // общий performClick ниже ничего бы не нажал.
+            quizView.activate();
+        } else if (currentScreenState == STATE_READER_LIST || currentScreenState == STATE_READER) {
+            readerController.onCenter();
         } else if (currentScreenState == STATE_WIFI_KEYBOARD) {
             handleKeyboardInput();
         } else if (currentScreenState != STATE_BRIGHTNESS && currentScreenState != STATE_STORAGE
@@ -7140,6 +6997,21 @@ public class MainActivity extends Activity {
         });
         containerSettingsItems.addView(btnAlbumTilt);
 
+        // Текст песни сразу на весь экран, если он есть у трека (плоская тема).
+        final LinearLayout btnLyricsDefault = createSettingRow("Lyrics by default",
+                isLyricsFullscreenDefault ? t("ON") : t("OFF"));
+        btnLyricsDefault.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                clickFeedback();
+                isLyricsFullscreenDefault = !isLyricsFullscreenDefault;
+                prefs.edit().putBoolean("lyrics_fullscreen_default", isLyricsFullscreenDefault).commit();
+                TextView tvStatus = (TextView) btnLyricsDefault.getChildAt(1);
+                tvStatus.setText(isLyricsFullscreenDefault ? t("ON") : t("OFF"));
+            }
+        });
+        containerSettingsItems.addView(btnLyricsDefault);
+
     }
 
     private void addSettingsNetwork() {
@@ -7265,6 +7137,22 @@ public class MainActivity extends Activity {
         });
         containerSettingsItems.addView(btnLangMenu);
 
+        final LinearLayout btnDeletedTracks = createSettingRow("Deleted tracks", deletedTracksCountLabel());
+        btnDeletedTracks.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                clickFeedback();
+                showDeletedTracksDialog(new Runnable() {
+                    @Override
+                    public void run() {
+                        View right = btnDeletedTracks.getChildAt(1);
+                        if (right instanceof TextView) ((TextView) right).setText(deletedTracksCountLabel());
+                    }
+                });
+            }
+        });
+        containerSettingsItems.addView(btnDeletedTracks);
+
         // 🚀 [수정] 기기에 쌓인 앨범 아트 이미지와 저장된 곡 정보(제목, 가수)까지 한 번에 싹 초기화합니다!
         LinearLayout btnClearCache = createSettingRow("Clear Album Art & Info", "〉 ");
         btnClearCache.setOnClickListener(new View.OnClickListener() {
@@ -7309,7 +7197,6 @@ public class MainActivity extends Activity {
 
                                     // 3. 메인 화면에 남아있는 이미지를 기본 아이콘으로 초기화합니다.
                                     ivAlbumArt.setImageResource(R.drawable.default_album);
-                                    ivPlayerBgBlur.setImageResource(0);
                                     lastAlbumArtBytes = null;
 
                                     // 🚀 4. [추가] 현재 틀어져 있는 곡의 제목과 가수도 파일 원본 이름으로 즉시 되돌리기
@@ -8650,6 +8537,26 @@ public class MainActivity extends Activity {
         }
     }
 
+    // Выборка та же, что у списка «Треки»: только папка /Music, аудиокниги в случайный порядок не попадают.
+    private void playRandomLibrary() {
+        if (isCustomScanning) {
+            showLoadingPopup();
+            return;
+        }
+        List<File> all = new ArrayList<>();
+        for (SongItem song : customLibrary) {
+            if (song.file.getAbsolutePath().contains("/Music"))
+                all.add(song.file);
+        }
+        if (all.isEmpty()) {
+            Y1Toast.makeText(this, t("No songs in your library yet."), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        java.util.Collections.shuffle(all);
+        com.themoon.y1.managers.AudioPlayerManager.getInstance().playTrackList(all, 0);
+        changeScreen(STATE_PLAYER);
+    }
+
     // 💡 2. 라이브러리 메인 라우터 (자체 스캔 버튼 적용)
     // 💡 기존 코드 수정
     // 🚀 [신규 추가] Music 루트 메뉴 전용 - 우측에 앨범 커버를 보여주는 분할 화면 켜기/끄기
@@ -8812,6 +8719,15 @@ public class MainActivity extends Activity {
                 });
                 if (!isMusicMenuItemHidden("coverflow"))
                     containerBrowserItems.addView(btnCoverFlow);
+
+                if (!isMusicMenuItemHidden("random")) {
+                    View btnRandom = createListButtonWithIcon("\uE043", t("Random"));
+                    btnRandom.setOnClickListener(v -> {
+                        clickFeedback();
+                        playRandomLibrary();
+                    });
+                    containerBrowserItems.addView(btnRandom);
+                }
 
                 if (!isMusicMenuItemHidden("playlists")) {
                     View btnM3uPlaylist = createListButtonWithIcon("\uE05F", t("Playlists"));
@@ -10646,6 +10562,13 @@ public class MainActivity extends Activity {
         java.util.Collections.sort(targetSongs, new java.util.Comparator<SongItem>() {
             @Override
             public int compare(SongItem s1, SongItem s2) {
+                // «Недавно добавленные»: новые сверху, чтобы последнее добавленное было первой строкой.
+                if ("RECENT".equals(virtualQueryType)) {
+                    long m1 = s1.file.lastModified();
+                    long m2 = s2.file.lastModified();
+                    if (m1 != m2) return m1 > m2 ? -1 : 1;
+                    return s1.title.compareToIgnoreCase(s2.title);
+                }
                 // 앨범 모드이거나 커버 플로우에서 넘어왔을 때만 트랙 번호로 정렬!
                 if ("ALBUM".equals(virtualQueryType) || "COVER_FLOW_ALBUM".equals(virtualQueryType)) {
                     int t1 = trackNumberMap.containsKey(s1.file.getAbsolutePath())
@@ -11945,6 +11868,9 @@ public class MainActivity extends Activity {
                         case "OPEN_MUSIC_QUIZ":
                             changeScreen(STATE_MUSIC_QUIZ);
                             break;
+                        case "OPEN_READER":
+                            changeScreen(STATE_READER_LIST);
+                            break;
                         case "OPEN_FAVORITES":
                             currentBrowserMode = BROWSER_FAVORITES;
                             changeScreen(STATE_BROWSER);
@@ -12116,15 +12042,20 @@ public class MainActivity extends Activity {
 
     // 🚀 [신규 엔진] 스펙트럼과 가사의 상태를 실시간으로 판별해서 화면을 교대해주는 전담 일꾼!
     private void refreshVisualizerState() {
+        if (ThemeManager.isFlatTheme()) {
+            refreshFlatLyrics();
+            return;
+        }
         View albumContainer = (View) ivAlbumArt.getParent();
+        boolean hasLyrics = !currentLyrics.isEmpty() || plainLyrics != null;
 
-        if (isVisualizerShowing) {
+        // В плоской теме спектр всегда живёт в правой колонке, а этот режим (обложка заменяется) нужен
+        // только для текста песни; без текста переключатель ничего не показывает.
+        if (isVisualizerShowing && (hasLyrics || !ThemeManager.isFlatTheme())) {
             albumContainer.setVisibility(View.GONE);
 
             // 현재 곡에 가사가 있다면? -> 스펙트럼을 끄고 가사창을 켭니다!
-            if (!currentLyrics.isEmpty() || plainLyrics != null) {
-                if (audioVisualizer != null)
-                    audioVisualizer.setEnabled(false);
+            if (hasLyrics) {
                 visualizerView.setVisibility(View.GONE);
                 visualizerView.clearAnimation(); // 잔상 제거
 
@@ -12143,22 +12074,175 @@ public class MainActivity extends Activity {
                 lyricScrollView.setVisibility(View.GONE);
                 visualizerView.setVisibility(View.VISIBLE);
                 visualizerView.invalidate();
-                if (audioVisualizer != null)
-                    audioVisualizer.setEnabled(true);
             }
         } else {
             // 시각화 모드가 아예 꺼져있다면 모두 숨기고 앨범 아트로 복귀
             visualizerView.setVisibility(View.GONE);
             lyricScrollView.setVisibility(View.GONE);
             albumContainer.setVisibility(View.VISIBLE);
-            if (audioVisualizer != null)
-                audioVisualizer.setEnabled(false);
         }
+        syncSpectrum();
+    }
+
+    /**
+     * Включает захват Visualizer только когда его кто-то видит: спектр плоской темы на экране плеера при
+     * играющей музыке и видимом незаблокированном приложении, либо старый крупный спектр классических тем.
+     * Захват гоняет FFT около 20 раз в секунду, на слабом Y1 лишнюю работу за кадром держать нельзя.
+     */
+    private void syncSpectrum() {
+        syncLyricsTick();
+        boolean onPlayer = currentScreenState == STATE_PLAYER && activityVisible && !inputLocked;
+        // Пока на месте спектра текст песни (строка под альбомом или весь экран), спектр скрыт и захват не нужен.
+        boolean flatWanted = onPlayer && flatSpectrum != null && ThemeManager.isFlatTheme()
+                && flatSpectrum.getVisibility() == View.VISIBLE
+                && com.themoon.y1.managers.AudioPlayerManager.getInstance().isPlaying();
+        boolean oldWanted = onPlayer && isVisualizerShowing && visualizerView != null
+                && visualizerView.getVisibility() == View.VISIBLE;
+        boolean want = flatWanted || oldWanted;
+        if (!flatWanted && flatSpectrum != null) flatSpectrum.reset();
+        if (audioVisualizer == null || want == spectrumRunning) return;
+        try {
+            audioVisualizer.setEnabled(want);
+            spectrumRunning = want;
+        } catch (Exception e) {
+            // Эффект мог быть освобождён при смене трека; setupVisualizer создаст новый и вызовет синхронизацию.
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        activityVisible = false;
+        if (readerController != null) readerController.onActivityPause();
+        syncSpectrum();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        activityVisible = true;
+        syncSpectrum();
     }
 
     // 💡 가운데 버튼(클릭)을 눌렀을 때는 스위치만 껐다 켜고 새로고침 일꾼을 부릅니다.
     private void toggleVisualizer() {
+        // В плоской теме переключать нечего, если у трека нет текста.
+        if (ThemeManager.isFlatTheme() && lyricsDoc == null) return;
         isVisualizerShowing = !isVisualizerShowing;
+        refreshVisualizerState();
+    }
+
+    private void applyLyricsTypefaces() {
+        if (lyricsSnippet == null || lyricsFull == null) return;
+        lyricsSnippet.setTypefaces(ThemeManager.getCustomFontTitle(), ThemeManager.getCustomFontBold(),
+                ThemeManager.getCustomFont());
+        lyricsFull.setTypefaces(ThemeManager.getCustomFontTitle(), ThemeManager.getCustomFontBold(),
+                ThemeManager.getCustomFont());
+    }
+
+    /** Текст песни открыт на весь экран (плоская тема); центр и «Назад» в этом состоянии его закрывают. */
+    private boolean lyricsFullShown() {
+        return ThemeManager.isFlatTheme() && isVisualizerShowing && lyricsDoc != null;
+    }
+
+    /**
+     * Строка под альбомом на месте спектра: только синхронный текст обычного трека. Простой текст
+     * показывать по одной строке нечем, а главы аудиокниги не подпись к музыке.
+     */
+    private boolean lyricsSnippetShown() {
+        return ThemeManager.isFlatTheme() && lyricsDoc != null && lyricsDoc.synced && !lyricsAreChapters
+                && !isVisualizerShowing;
+    }
+
+    /**
+     * NEXT/PREV прыгают по главам вместо смены трека, пока открыт список глав m4b или (в классических
+     * темах) окно текста: так было задумано для аудиокниг. Строки песни в плоской теме треки не заменяют.
+     */
+    private boolean lyricWarpActive() {
+        return isVisualizerShowing && lyricTimestamps != null && !lyricTimestamps.isEmpty()
+                && (!ThemeManager.isFlatTheme() || lyricsAreChapters);
+    }
+
+    /** Что показывать на плеере плоской темы: спектр, строку под альбомом или весь экран с текстом. */
+    private void refreshFlatLyrics() {
+        if (lyricsSnippet == null || lyricsFull == null || flatSpectrum == null || ivAlbumArt == null) return;
+        boolean full = lyricsFullShown();
+        boolean snippet = lyricsSnippetShown();
+        // Старые вью окна текста принадлежат классическим темам; после смены темы они не должны остаться видны.
+        if (visualizerView != null) visualizerView.setVisibility(View.GONE);
+        if (lyricScrollView != null) lyricScrollView.setVisibility(View.GONE);
+        ((View) ivAlbumArt.getParent()).setVisibility(View.VISIBLE);
+        // INVISIBLE, а не GONE: возврат с текста на обложку не заставляет заново мерить всю колонку.
+        if (layoutPlayerContent != null) layoutPlayerContent.setVisibility(full ? View.INVISIBLE : View.VISIBLE);
+        lyricsFull.setVisibility(full ? View.VISIBLE : View.GONE);
+        lyricsSnippet.setVisibility(snippet ? View.VISIBLE : View.GONE);
+        flatSpectrum.setVisibility(full || snippet ? View.GONE : View.VISIBLE);
+        updateLyricsNow();
+        syncSpectrum();
+    }
+
+    /** Строка (или прокрутка) по текущей позиции; зовётся из таймера и при каждой смене того, что на экране. */
+    private void updateLyricsNow() {
+        if (lyricsDoc == null || !ThemeManager.isFlatTheme()) return;
+        boolean full = lyricsFullShown();
+        if (!full && !lyricsSnippetShown()) return;
+        try {
+            com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+            int pos = am.getCurrentPosition();
+            if (full) lyricsFull.setHeader(tvPlayerTitle.getText(), tvPlayerArtist.getText());
+            if (lyricsDoc.synced) {
+                int index = lyricsDoc.indexAt(
+                        (int) LyricsShift.effectivePosition(pos + LYRICS_LOOKAHEAD_MS, lyricsShiftMs));
+                if (full) lyricsFull.setIndex(index);
+                else lyricsSnippet.setIndex(index);
+            } else if (full) {
+                // Простой текст едет пропорционально прогрессу, как в прежнем движке: первые 5 с стоит
+                // на месте, остаток длины трека распределяется на всю высоту текста.
+                int dur = am.getDuration();
+                float f = 0f;
+                if (dur > LYRICS_PLAIN_DELAY_MS) {
+                    f = pos <= LYRICS_PLAIN_DELAY_MS ? 0f : (float) (pos - LYRICS_PLAIN_DELAY_MS) / (dur - LYRICS_PLAIN_DELAY_MS);
+                } else if (dur > 0) {
+                    f = (float) pos / dur;
+                }
+                lyricsFull.setScrollFraction(f);
+            }
+        } catch (IllegalStateException e) {
+            // Плеер мог освободиться между проверкой и вызовом; следующий тик возьмёт новую позицию.
+        }
+    }
+
+    private final Runnable lyricsTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!lyricsTickScheduled) return;
+            updateLyricsNow();
+            lyricsHandler.postDelayed(this, LYRICS_TICK_MS);
+        }
+    };
+
+    /**
+     * Таймер 250 мс крутится, только пока текст виден: экран плеера, музыка играет, приложение на
+     * переднем плане и не заблокировано. Иначе на слабом Y1 он будил бы процессор впустую.
+     */
+    private void syncLyricsTick() {
+        boolean want = ThemeManager.isFlatTheme() && lyricsDoc != null
+                && (lyricsFullShown() || lyricsSnippetShown())
+                && currentScreenState == STATE_PLAYER && activityVisible && !inputLocked
+                && com.themoon.y1.managers.AudioPlayerManager.getInstance().isPlaying();
+        if (want && !lyricsTickScheduled) {
+            lyricsTickScheduled = true;
+            updateLyricsNow();
+            lyricsHandler.postDelayed(lyricsTick, LYRICS_TICK_MS);
+        } else if (!want && lyricsTickScheduled) {
+            lyricsTickScheduled = false;
+            lyricsHandler.removeCallbacks(lyricsTick);
+        }
+    }
+
+    /** Закрывает полноэкранный текст (центр, «Назад»): до следующего трека он остаётся закрытым. */
+    private void closeFullscreenLyrics() {
+        isVisualizerShowing = false;
         refreshVisualizerState();
     }
 
@@ -12171,6 +12255,7 @@ public class MainActivity extends Activity {
                 audioVisualizer.release();
                 audioVisualizer = null;
             }
+            spectrumRunning = false;
 
             // ⭕ [아래 코드로 덮어쓰기]
             audioVisualizer = new android.media.audiofx.Visualizer(
@@ -12185,16 +12270,18 @@ public class MainActivity extends Activity {
                 @Override
                 public void onFftDataCapture(android.media.audiofx.Visualizer visualizer, byte[] fft,
                         int samplingRate) {
+                    if (spectrumRunning && flatSpectrum != null && flatSpectrum.getVisibility() == View.VISIBLE) {
+                        flatSpectrum.updateVisualizer(fft, samplingRate);
+                    }
                     if (isVisualizerShowing && visualizerView != null
                             && visualizerView.getVisibility() == View.VISIBLE) {
-                        visualizerView.updateVisualizer(fft, currentAlbumColor);
+                        visualizerView.setBarColor(currentAlbumColor);
+                        visualizerView.updateVisualizer(fft, samplingRate);
                     }
                 }
-            }, android.media.audiofx.Visualizer.getMaxCaptureRate() / 2, false, true);
+            }, android.media.audiofx.Visualizer.getMaxCaptureRate(), false, true);
 
-            if (isVisualizerShowing) {
-                audioVisualizer.setEnabled(true);
-            }
+            syncSpectrum();
         } catch (Exception e) {
         }
     }
@@ -12202,10 +12289,34 @@ public class MainActivity extends Activity {
     // 🚀 [가사 엔진] .lrc 파일을 찾아 시간과 텍스트를 분리해 메모리에 담습니다.
     // 🚀 [가사 엔진 업그레이드] .lrc, USLT는 물론 m4b 챕터까지 싹 다 긁어오는 만능 파서!
     private void loadLyrics(File audioFile) {
+        loadLyricsLegacy(audioFile);
+        // Документ плоской темы собирается из того же источника, что и старые поля: главы m4b берутся
+        // из карты, остальное из сырого текста (там сохраняются пустые строки-паузы, которых нет в карте).
+        LyricsDoc doc = null;
+        if (lyricsAreChapters) doc = LyricsDoc.fromMap(currentLyrics);
+        else if (lyricsRawText != null) doc = LyricsDoc.parse(lyricsRawText);
+        lyricsRawText = null;
+        lyricsDoc = doc;
+        // Смена трека обрывает подгонку без сохранения, а сдвиг берётся у нового трека.
+        lyricsSyncMode = false;
+        updateLyricsSyncOverlay();
+        lyricsShiftMs = audioFile == null ? 0
+                : LyricsShift.clamp(prefs.getInt(LYRICS_SHIFT_KEY_PREFIX + audioFile.getAbsolutePath(), 0));
+        int fullMode = doc != null && !doc.synced ? LyricsView.MODE_FULL_PLAIN : LyricsView.MODE_FULL_SYNCED;
+        if (lyricsFull != null) {
+            lyricsFull.setMode(fullMode);
+            lyricsFull.setDoc(doc);
+        }
+        if (lyricsSnippet != null) lyricsSnippet.setDoc(doc);
+    }
+
+    private void loadLyricsLegacy(File audioFile) {
         currentLyrics.clear();
         lyricTimestamps.clear();
         lastLyricIndex = -1;
         plainLyrics = null;
+        lyricsRawText = null;
+        lyricsAreChapters = false;
         if (tvLyrics != null)
             tvLyrics.setText("");
 
@@ -12222,6 +12333,7 @@ public class MainActivity extends Activity {
             if (!chResult.chaptersMap.isEmpty()) {
                 currentLyrics.putAll(chResult.chaptersMap);
                 lyricTimestamps.addAll(chResult.timestamps);
+                lyricsAreChapters = true;
                 return; // 💡 챕터를 세팅했으니 가사 찾기는 여기서 조기 종료!
             }
         }
@@ -12240,8 +12352,10 @@ public class MainActivity extends Activity {
                     String line;
                     java.util.regex.Pattern pattern = java.util.regex.Pattern
                             .compile("\\[(\\d{2}):(\\d{2})\\.(\\d{2,3})\\](.*)");
+                    StringBuilder rawLrc = new StringBuilder();
 
                     while ((line = br.readLine()) != null) {
+                        rawLrc.append(line).append('\n');
                         java.util.regex.Matcher matcher = pattern.matcher(line);
                         if (matcher.find()) {
                             int min = Integer.parseInt(matcher.group(1));
@@ -12259,6 +12373,7 @@ public class MainActivity extends Activity {
                         }
                     }
                     br.close();
+                    lyricsRawText = rawLrc.toString();
                     lyricTimestamps = new ArrayList<>(currentLyrics.keySet());
                     return; // 성공했으면 여기서 엔진 조기 종료!
                 } catch (Exception e) {
@@ -12282,6 +12397,9 @@ public class MainActivity extends Activity {
             // 그 외(MP3 등)는 순정 ID3v2(USLT) 가사 파서 가동!
             plainLyrics = extractEmbeddedLyrics(audioFile);
         }
+
+        // Ниже plainLyrics может обнулиться, если внутри оказался синхронный текст; сырой остаётся для LyricsDoc.
+        lyricsRawText = plainLyrics;
 
         // 🚀 [신규 장착] 3. 파일 내부에서 캔 가사(plainLyrics) 안에 타임라인 포맷이 있는지 정밀 검사합니다!
         if (plainLyrics != null && !plainLyrics.isEmpty()) {
@@ -12423,30 +12541,26 @@ public class MainActivity extends Activity {
 
     private void updatePlayerStatusIndicators() {
         try {
-            // 1. 셔플 아이콘 세팅
-            if (ivPlayerShuffleStatus != null) {
-                if (isShuffleMode) {
-                    ivPlayerShuffleStatus.setImageResource(R.drawable.ic_shuffle);
-                    ivPlayerShuffleStatus.setVisibility(View.VISIBLE);
+            if (ivStatusShuffle != null) {
+                ivStatusShuffle.setVisibility(isShuffleMode ? View.VISIBLE : View.GONE);
+            }
+            if (ivStatusRepeat != null) {
+                // repeatMode: 0 выключен, 1 один трек, 2 весь список.
+                if (repeatMode == 1 || repeatMode == 2) {
+                    HugeGlyph glyph = repeatMode == 1 ? statusRepeatOneGlyph : statusRepeatGlyph;
+                    if (ivStatusRepeat.getDrawable() != glyph) ivStatusRepeat.setImageDrawable(glyph);
+                    ivStatusRepeat.setVisibility(View.VISIBLE);
                 } else {
-                    ivPlayerShuffleStatus.setVisibility(View.GONE);
+                    ivStatusRepeat.setVisibility(View.GONE);
                 }
             }
-            if (ivPlayerRepeatStatus != null) {
-                if (repeatMode == 1) { // 한 곡 반복
-                    ivPlayerRepeatStatus.setImageResource(R.drawable.ic_repeat_one);
-                    ivPlayerRepeatStatus.setVisibility(View.VISIBLE);
-                } else if (repeatMode == 2) { // 전곡 반복
-                    ivPlayerRepeatStatus.setImageResource(R.drawable.ic_repeat);
-                    ivPlayerRepeatStatus.setVisibility(View.VISIBLE);
-                } else { // 반복 꺼짐
-                    ivPlayerRepeatStatus.setVisibility(View.GONE);
-                }
+            boolean favorite = isCurrentTrackFavorite();
+            if (coverLikeGlyph != null) {
+                coverLikeGlyph.setFilled(favorite);
+                coverLikeGlyph.setColor(favorite ? (ThemeManager.getListButtonFocusedBg() | 0xFF000000)
+                        : ThemeManager.getTextColorPrimary());
             }
             if (ivPlayerFavoriteStatus != null) {
-                boolean favorite = !currentPlaylist.isEmpty()
-                        && currentIndex >= 0 && currentIndex < currentPlaylist.size()
-                        && favoritePaths.contains(currentPlaylist.get(currentIndex).getAbsolutePath());
                 boolean flat = ThemeManager.isFlatTheme();
                 float density = getResources().getDisplayMetrics().density;
                 int color = favorite
@@ -12459,19 +12573,27 @@ public class MainActivity extends Activity {
         }
     }
 
-    // 🚀 [신규 추가] 휠 버튼을 길게 누를 때 작동할 즐겨찾기 스위치 함수! (다른 함수들 사이에 넣으세요)
-    private void toggleFavorite() {
-        if (currentPlaylist.isEmpty())
-            return;
-        File currentSong = currentPlaylist.get(currentIndex);
-        String path = currentSong.getAbsolutePath();
+    private boolean isCurrentTrackFavorite() {
+        return !currentPlaylist.isEmpty() && currentIndex >= 0 && currentIndex < currentPlaylist.size()
+                && favoritePaths.contains(currentPlaylist.get(currentIndex).getAbsolutePath());
+    }
+
+    /**
+     * @param announce показать тост; лайк с центральной кнопки плеера идёт без тоста,
+     *                 там ответом служит само сердце
+     * @return false, если трека нет и переключать нечего
+     */
+    private boolean toggleFavorite(boolean announce) {
+        if (currentPlaylist.isEmpty() || currentIndex < 0 || currentIndex >= currentPlaylist.size())
+            return false;
+        String path = currentPlaylist.get(currentIndex).getAbsolutePath();
 
         if (favoritePaths.contains(path)) {
             favoritePaths.remove(path);
-            Y1Toast.makeText(this, t("Removed from Favorites."), Toast.LENGTH_SHORT).show();
+            if (announce) Y1Toast.makeText(this, t("Removed from Favorites."), Toast.LENGTH_SHORT).show();
         } else {
             favoritePaths.add(path);
-            Y1Toast.makeText(this, t("Added to Favorites."), Toast.LENGTH_SHORT).show();
+            if (announce) Y1Toast.makeText(this, t("Added to Favorites."), Toast.LENGTH_SHORT).show();
         }
 
         try {
@@ -12480,122 +12602,191 @@ public class MainActivity extends Activity {
         }
 
         updatePlayerStatusIndicators(); // 💖 아이콘 새로고침
+        return true;
     }
 
-    // 🚀 [iPod 스타일] 곡별 별점 (1~5점, 0 = 별점 없음) - 경로 기준으로 저장
-    public int getSongRating(String path) {
-        return prefs.getInt("rating_" + path, 0);
-    }
-
-    public void setSongRating(String path, int rating) {
-        prefs.edit().putInt("rating_" + path, rating).commit();
-        updateRatingDisplay();
-    }
-
-    public void updateRatingDisplay() {
-        if (tvPlayerRating == null)
-            return;
-        if (currentPlaylist.isEmpty() || currentIndex < 0 || currentIndex >= currentPlaylist.size()) {
-            tvPlayerRating.setVisibility(View.GONE);
-            return;
+    private View likePopTarget;
+    // Вторая половина «пульса» сердца; один экземпляр на всё время жизни, чтобы не создавать на каждый лайк.
+    private final Runnable likePopBack = new Runnable() {
+        @Override
+        public void run() {
+            if (likePopTarget != null) likePopTarget.animate().scaleX(1f).scaleY(1f).setDuration(80);
         }
-        int rating = getSongRating(currentPlaylist.get(currentIndex).getAbsolutePath());
-        if (rating <= 0) {
-            tvPlayerRating.setVisibility(View.GONE);
-            return;
-        }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < 5; i++)
-            sb.append(i < rating ? "★" : "☆"); // ★ / ☆
-        tvPlayerRating.setText(sb.toString());
-        tvPlayerRating.setVisibility(View.VISIBLE);
+    };
+
+    /** Центральная кнопка на экране плеера: лайк сразу по нажатию, без ожидания двойного клика. */
+    private void likeCurrentTrack() {
+        if (!toggleFavorite(false)) return;
+        clickFeedback();
+        View heart = ThemeManager.isFlatTheme() ? ivCoverLike : ivPlayerFavoriteStatus;
+        if (heart == null || heart.getVisibility() != View.VISIBLE) return;
+        // Пульс 1.0 > 1.25 > 1.0 за 160 мс: только transform, без перерисовки обложки.
+        likePopTarget = heart;
+        heart.animate().cancel();
+        heart.setScaleX(1f);
+        heart.setScaleY(1f);
+        heart.animate().scaleX(1.25f).scaleY(1.25f).setDuration(80).withEndAction(likePopBack);
     }
 
-    // 🚀 [iPod 스타일] Now Playing 하단 바 4단계 순환 (Progress→Seek→Shuffle&Repeat→Rating→Progress)
-    // 🚀 [Now Playing 커버 기울기 설정] 켜져있으면 18도 입체 기울기, 꺼져있으면 정면 평평하게!
+    // Наклон обложки только для классических тем: в плоской теме обложка стоит ровно по сетке.
     private void applyAlbumTiltSetting() {
-        float tilt = isAlbumTiltEnabled ? 18f : 0f;
+        float tilt = (isAlbumTiltEnabled && !ThemeManager.isFlatTheme()) ? 18f : 0f;
         if (frameAlbumArt != null)
             frameAlbumArt.setRotationY(tilt);
         if (frameAlbumReflection != null)
             frameAlbumReflection.setRotationY(tilt);
     }
 
-    private void updateNowPlayingBottomBarState() {
-        if (rowPlayerProgress == null) return;
-        volumeHandler.removeCallbacks(hideVolumeTask);
-        volumeHandler.removeCallbacks(hideNowPlayingVolumeTask);
-        if (rowPlayerVolume != null) rowPlayerVolume.setVisibility(View.GONE);
-        rowPlayerProgress.setVisibility(nowPlayingBottomState == 0 ? View.VISIBLE : View.GONE);
-        rowPlayerSeek.setVisibility(nowPlayingBottomState == 1 ? View.VISIBLE : View.GONE);
-        rowPlayerShuffleRepeat.setVisibility(nowPlayingBottomState == 2 ? View.VISIBLE : View.GONE);
-        rowPlayerRatingScrub.setVisibility(nowPlayingBottomState == 3 ? View.VISIBLE : View.GONE);
+    /** Цвета глифов строки состояния и сердца под текущую тему. */
+    private void applyPlayerGlyphColors() {
+        int statusColor = ThemeManager.isFlatTheme() ? ThemeManager.getTextColorPrimary()
+                : (tvStatusClock != null ? tvStatusClock.getCurrentTextColor() : 0xFFFFFFFF);
+        if (statusShuffleGlyph != null) statusShuffleGlyph.setColor(statusColor);
+        if (statusRepeatGlyph != null) statusRepeatGlyph.setColor(statusColor);
+        if (statusRepeatOneGlyph != null) statusRepeatOneGlyph.setColor(statusColor);
+        if (statusSleepGlyph != null) statusSleepGlyph.setColor(statusColor);
+        if (tvStatusSleep != null) {
+            tvStatusSleep.setTextColor(statusColor);
+            tvStatusSleep.setTypeface(ThemeManager.getCustomFontBold());
+        }
+        applyAlbumTiltSetting();
+        updatePlayerStatusIndicators();
+    }
 
-        if (nowPlayingBottomState == 1) {
-            com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
-            int current = pendingSeekChanged ? pendingSeekPosition : am.getCurrentPosition();
-            int duration = am.getDuration();
-            tvPlayerSeekCurrent.setText(formatTime(current));
-            tvPlayerSeekTotal.setText("-" + formatTime(Math.max(0, duration - current)));
-            seekPlayerScrub.setMax(duration > 0 ? duration : 1000);
-            seekPlayerScrub.setProgress(current);
-        } else if (nowPlayingBottomState == 2) {
-            updateShuffleRepeatScrubLabels();
-        } else if (nowPlayingBottomState == 3) {
-            updateRatingScrubStars();
+    // Колесо на экране плеера управляет только громкостью.
+    private void handleNowPlayingWheelInput(boolean up) {
+        if (lyricsSyncMode) {
+            // В подгонке текста колесо занято сдвигом, громкость не трогаем.
+            stepLyricsSync(up);
+            clickFeedback();
+            return;
+        }
+        adjustVolume(up);
+        clickFeedback();
+    }
+
+    /** Полоса и подписи времени для позиции; без аллокаций, текст меняется только при смене секунды. */
+    private void renderPlayerProgress(int position, int duration) {
+        int dur = Math.max(0, duration);
+        int pos = Math.max(0, dur > 0 ? Math.min(position, dur) : position);
+        if (playerProgress != null) playerProgress.setProgress(dur > 0 ? (int) ((long) pos * 100 / dur) : 0);
+        if (pvPlayerProgress != null) pvPlayerProgress.setFraction(dur > 0 ? (float) pos / dur : 0f);
+
+        int elapsed = pos / 1000;
+        if (elapsed != shownElapsedSec) {
+            shownElapsedSec = elapsed;
+            int n = writeClock(elapsedChars, elapsed, false);
+            if (tvPlayerTimeCurrent != null) tvPlayerTimeCurrent.setText(elapsedChars, 0, n);
+            if (tvFlatTimeElapsed != null) tvFlatTimeElapsed.setText(elapsedChars, 0, n);
+        }
+        // Остаток округляется вверх: прошло + осталось в сумме дают длину трека, как в iPod.
+        int remaining = (Math.max(0, dur - pos) + 999) / 1000;
+        if (remaining != shownRemainingSec) {
+            shownRemainingSec = remaining;
+            int n = writeClock(remainingChars, remaining, true);
+            if (tvPlayerTimeTotal != null) tvPlayerTimeTotal.setText(remainingChars, 0, n);
+            if (tvFlatTimeLeft != null) tvFlatTimeLeft.setText(remainingChars, 0, n);
         }
     }
 
-    // 🚀 [공용화] Now Playing 화면에서 휠을 돌렸을 때의 동작 - 순환 상태에 따라 볼륨/탐색/셔플&리핏/별점 중 하나로 분기
-    private void handleNowPlayingWheelInput(boolean up) {
-        if (nowPlayingBottomState == 1) {
-            com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
-            if (!pendingSeekChanged) pendingSeekPosition = am.getCurrentPosition();
-            pendingSeekPosition = (int) Math.max(0L, Math.min((long) am.getDuration(),
-                    (long) pendingSeekPosition + (up ? 5000 : -5000)));
-            pendingSeekChanged = true;
-            updateNowPlayingBottomBarState();
-        } else if (nowPlayingBottomState == 2) {
-            if (up) {
-                cycleRepeatMode();
-            } else {
-                toggleShuffleMode();
+    /** Для AudioPlayerManager: позиция после загрузки трека, когда длина стала известна. */
+    public void refreshPlayerProgress(int position, int duration) {
+        if (!seekHoldPreview) renderPlayerProgress(position, duration);
+    }
+
+    /** Новый трек ещё грузится: нули на полосе и в подписях, кэш секунд сброшен. */
+    public void resetPlayerProgress() {
+        shownElapsedSec = -1;
+        shownRemainingSec = -1;
+        if (!seekHoldPreview) renderPlayerProgress(0, 0);
+    }
+
+    /** Пишет [-]mm:ss в buf и возвращает длину; минуты не обрезаются по 60 (аудиокниги). */
+    private static int writeClock(char[] buf, int totalSec, boolean minus) {
+        int m = Math.min(totalSec / 60, 999);
+        int s = totalSec % 60;
+        int i = 0;
+        if (minus) buf[i++] = '-';
+        if (m >= 100) buf[i++] = (char) ('0' + m / 100);
+        buf[i++] = (char) ('0' + (m / 10) % 10);
+        buf[i++] = (char) ('0' + m % 10);
+        buf[i++] = ':';
+        buf[i++] = (char) ('0' + s / 10);
+        buf[i++] = (char) ('0' + s % 10);
+        return i;
+    }
+
+    /**
+     * Один автоповтор удержания NEXT/PREV. Шаг по расписанию SeekRamp, не чаще раза в 250 мс.
+     *
+     * @param preview на экране плеера цель только показывается (толстая полоса и пузырь),
+     *                а звук переходит к ней один раз при отпускании: частые seek на слабом
+     *                процессоре Y1 давали заикание; при погасшем экране перемотка живая
+     */
+    private void seekHoldStep(KeyEvent event, boolean forward, boolean preview) {
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        if (am == null) return;
+        long now = event.getEventTime();
+        android.util.Log.d("SEEKDBG", "rep=" + event.getRepeatCount() + " t=" + now + " down=" + event.getDownTime() + " last=" + lastSeekTime + " tgt=" + seekHoldTarget);
+        if (!isSeekPerformed) {
+            isSeekPerformed = true;
+            lastSeekTime = 0;
+            seekHoldPreview = preview;
+            if (preview) {
+                seekHoldTarget = am.getCurrentPosition();
+                if (pvPlayerProgress != null) pvPlayerProgress.setThick(true);
             }
-            updateShuffleRepeatScrubLabels();
-        } else if (nowPlayingBottomState == 3) {
-            if (!currentPlaylist.isEmpty() && currentIndex >= 0 && currentIndex < currentPlaylist.size()) {
-                String path = currentPlaylist.get(currentIndex).getAbsolutePath();
-                int rating = getSongRating(path);
-                rating = up ? Math.min(5, rating + 1) : Math.max(0, rating - 1);
-                setSongRating(path, rating);
-                updateRatingScrubStars();
-            }
+        }
+        if (!SeekRamp.isStepDue(now, lastSeekTime)) return;
+        lastSeekTime = now;
+        long held = now - event.getDownTime();
+        if (seekHoldPreview) {
+            int duration = am.getDuration();
+            seekHoldTarget = SeekRamp.nextTarget(seekHoldTarget, forward, held, duration);
+            renderPlayerProgress(seekHoldTarget, duration);
+            if (pvPlayerProgress != null) pvPlayerProgress.showBubble(seekHoldTarget);
         } else {
-            adjustVolume(up);
+            int step = SeekRamp.stepForHoldMs(held);
+            am.seekRelative(forward ? step : -step);
         }
         clickFeedback();
     }
 
-    private void updateShuffleRepeatScrubLabels() {
-        if (tvScrubShuffleValue == null) return;
-        tvScrubShuffleValue.setText(t("Shuffle") + ": " + (isShuffleMode ? t("Songs") : t("Off")));
-        tvScrubRepeatValue.setText(t("Repeat") + ": " + t(getRepeatModeText(repeatMode)));
-        tvScrubShuffleValue.setTextColor(ThemeManager.getTextColorPrimary());
-        tvScrubRepeatValue.setTextColor(ThemeManager.getTextColorPrimary());
+    /** Отпускание после удержания: звук к цели, полоса обратно в обычный вид. */
+    private void finishSeekHold() {
+        if (!seekHoldPreview) return;
+        seekHoldPreview = false;
+        if (pvPlayerProgress != null) {
+            pvPlayerProgress.setThick(false);
+            pvPlayerProgress.hideBubble();
+        }
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        if (am == null) return;
+        am.seekRelative(seekHoldTarget - am.getCurrentPosition());
+        renderPlayerProgress(seekHoldTarget, am.getDuration());
     }
 
-    private void updateRatingScrubStars() {
-        if (tvScrubStars == null || currentPlaylist.isEmpty() || currentIndex < 0
-                || currentIndex >= currentPlaylist.size())
-            return;
-        int rating = getSongRating(currentPlaylist.get(currentIndex).getAbsolutePath());
-        for (int i = 0; i < tvScrubStars.length; i++) {
-            tvScrubStars[i].setText(i < rating ? "★" : "•");
-            tvScrubStars[i].setTextColor(ThemeManager.getTextColorPrimary());
+    /** Возврат низа плеера после двухсекундного показа громкости. */
+    private void hideNowPlayingVolume() {
+        if (rowPlayerVolume != null) rowPlayerVolume.setVisibility(View.GONE);
+        boolean flat = ThemeManager.isFlatTheme();
+        if (rowPlayerProgress != null) rowPlayerProgress.setVisibility(flat ? View.GONE : View.VISIBLE);
+        if (rowPlayerFlatTimes != null) rowPlayerFlatTimes.setVisibility(View.VISIBLE);
+    }
+
+    /** Смена трека в плоской теме: обложка и текст проявляются за 180 мс (только прозрачность). */
+    private void fadeInPlayerTrack() {
+        if (!ThemeManager.isFlatTheme() || currentScreenState != STATE_PLAYER) return;
+        View[] targets = {frameAlbumArt, tvPlayerTitle != null ? (View) tvPlayerTitle.getParent() : null};
+        for (View v : targets) {
+            if (v == null) continue;
+            v.animate().cancel();
+            v.setAlpha(0.3f);
+            v.animate().alpha(1f).setDuration(180);
         }
     }
 
-    // 🚀 [공용화] 셔플 On/Off 토글 - Settings 화면과 Now Playing 하단 위젯이 함께 사용합니다.
+    // Общий переключатель: им пользуются настройки и меню удержания PLAY на экране плеера.
     private void toggleShuffleMode() {
         isShuffleMode = !isShuffleMode;
         updatePlayerStatusIndicators();
@@ -12620,7 +12811,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // 🚀 [공용화] Repeat Off→One→All 순환 - Settings 화면과 Now Playing 하단 위젯이 함께 사용합니다.
+    // Повтор по кругу «выкл, один, все»; им пользуются настройки и меню удержания PLAY на экране плеера.
     private void cycleRepeatMode() {
         repeatMode = (repeatMode + 1) % 3;
         updatePlayerStatusIndicators();
@@ -12628,6 +12819,102 @@ public class MainActivity extends Activity {
             prefs.edit().putInt("repeat_mode", repeatMode).commit();
         } catch (Exception e) {
         }
+    }
+
+    private void cycleSleepTimer() {
+        sleepHandler.removeCallbacks(sleepTick);
+        sleepTimer.cycle(SystemClock.elapsedRealtime());
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        // Смена варианта посреди затухания сразу возвращает громкость.
+        am.setFadeVolume(1f);
+        am.setEndOfTrackSleep(sleepTimer.option() == SleepTimer.END_OF_TRACK);
+        updateSleepIndicator(SystemClock.elapsedRealtime());
+        onSleepTick();
+    }
+
+    private void stopSleepTimer() {
+        sleepHandler.removeCallbacks(sleepTick);
+        sleepTimer.cancel();
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        am.setFadeVolume(1f);
+        am.setEndOfTrackSleep(false);
+        updateSleepIndicator(0);
+    }
+
+    /**
+     * Минутные варианты тикают раз в минуту (чтобы обновить число), в последние 30 секунд каждые
+     * 500 мс (шаг затухания: 60 ступеней на 30 с, на слух плавно). END_OF_TRACK тиков не просит:
+     * его срабатывание приходит от плеера в {@link #consumeEndOfTrackSleep()}.
+     */
+    private void onSleepTick() {
+        if (sleepTimer.option() == SleepTimer.OFF) return;
+        long now = SystemClock.elapsedRealtime();
+        if (sleepTimer.isExpired(now)) {
+            fireSleepTimer();
+            return;
+        }
+        if (sleepTimer.option() == SleepTimer.END_OF_TRACK) return;
+        long left = sleepTimer.remainingMs(now);
+        updateSleepIndicator(now);
+        if (left <= SleepTimer.FADE_MS) {
+            com.themoon.y1.managers.AudioPlayerManager.getInstance().setFadeVolume(sleepTimer.fadeFactor(now));
+            sleepHandler.postDelayed(sleepTick, 500);
+        } else {
+            // Число в строке состояния меняется, когда остаток падает до целой минуты; затухание начинается
+            // за 30 с до конца, до этого момента спать не надо.
+            long untilMinuteChange = left - (sleepTimer.remainingMinutes(now) - 1) * 60_000L;
+            sleepHandler.postDelayed(sleepTick, Math.min(untilMinuteChange, left - SleepTimer.FADE_MS));
+        }
+    }
+
+    private void fireSleepTimer() {
+        com.themoon.y1.managers.FmRadioManager fm = com.themoon.y1.managers.FmRadioManager.getInstance(this);
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        // Радио и плеер взаимоисключающи: если чип включён, звучит радио.
+        if (fm.isPowerUp) {
+            fm.powerDown();
+        } else if (am.isPlaying()) {
+            am.playOrPauseMusic();
+        }
+        // Громкость возвращается после паузы: команда паузы и множитель идут в плеер по порядку.
+        stopSleepTimer();
+        updateGlobalStatusPlayIcon();
+    }
+
+    /**
+     * Плеер зовёт это, когда трек закончился. true: таймер «до конца трека» сработал, плеер уже
+     * остановлен, и следующий трек запускать не нужно.
+     */
+    public boolean consumeEndOfTrackSleep() {
+        if (sleepTimer.option() != SleepTimer.END_OF_TRACK) return false;
+        isPausedByHand = true;
+        stopSleepTimer();
+        updateGlobalStatusPlayIcon();
+        return true;
+    }
+
+    private String sleepMenuLabel() {
+        switch (sleepTimer.option()) {
+            case SleepTimer.MIN_15: return t("Sleep timer: 15 min");
+            case SleepTimer.MIN_30: return t("Sleep timer: 30 min");
+            case SleepTimer.MIN_45: return t("Sleep timer: 45 min");
+            case SleepTimer.MIN_60: return t("Sleep timer: 60 min");
+            case SleepTimer.MIN_90: return t("Sleep timer: 90 min");
+            case SleepTimer.END_OF_TRACK: return t("Sleep timer: End of track");
+            default: return t("Sleep timer: Off");
+        }
+    }
+
+    private void updateSleepIndicator(long nowMs) {
+        if (llStatusSleep == null) return;
+        int option = sleepTimer.option();
+        llStatusSleep.setVisibility(option == SleepTimer.OFF ? View.GONE : View.VISIBLE);
+        int minutes = (option == SleepTimer.OFF || option == SleepTimer.END_OF_TRACK)
+                ? 0 : sleepTimer.remainingMinutes(nowMs);
+        if (minutes == shownSleepMinutes) return;
+        shownSleepMinutes = minutes;
+        if (minutes > 0) tvStatusSleep.setText(String.valueOf(minutes));
+        tvStatusSleep.setVisibility(minutes > 0 ? View.VISIBLE : View.GONE);
     }
 
     private String displayedPlayerPath;
@@ -12642,28 +12929,40 @@ public class MainActivity extends Activity {
                     displayedPlayerPath = currentFile.getAbsolutePath();
                     // 🚀 곡이 바뀔 때마다 같은 이름의 .lrc 파일이 있는지 탐색합니다!
                     loadLyrics(currentFile);
+                    // В плоской теме вид текста решается заново для каждого трека: открытый и закрытый
+                    // вручную текст прошлого трека на следующий не переносится.
+                    if (ThemeManager.isFlatTheme()) {
+                        isVisualizerShowing = isLyricsFullscreenDefault && lyricsDoc != null && !lyricsAreChapters;
+                    }
                     refreshVisualizerState();
-                    updateRatingDisplay();
-                    // 🚀 [iPod 스타일] 새 곡이 시작되면 항상 기본 Progress 바 상태로 리셋!
-                    pendingSeekChanged = false;
-                    nowPlayingBottomState = 0;
-                    updateNowPlayingBottomBarState();
+                    fadeInPlayerTrack();
+                }
+                if (tvFlatTrackPos != null) {
+                    tvFlatTrackPos.setText((currentIndex + 1) + " / " + currentPlaylist.size());
                 }
             }
             com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
 
             int position = am.getCurrentPosition();
             int duration = am.getDuration();
-            tvPlayerTimeCurrent.setText(formatTime(position));
-            tvPlayerTimeTotal.setText("-" + formatTime(Math.max(0, duration - position)));
+            if (!seekHoldPreview) renderPlayerProgress(position, duration);
+            boolean flat = ThemeManager.isFlatTheme();
             if (am.isPlaying()) {
                 ivAlbumArt.setAlpha(1.0f);
                 ivPauseOverlay.setVisibility(View.GONE);
+                if (viewCoverDim != null) viewCoverDim.setVisibility(View.GONE);
                 progressHandler.removeCallbacks(updateProgressTask);
                 progressHandler.post(updateProgressTask);
+            } else if (flat) {
+                // Пауза в плоской теме: затемняющий слой и голый глиф паузы; сама картинка не прозрачнеет.
+                ivAlbumArt.setAlpha(1.0f);
+                if (viewCoverDim != null) viewCoverDim.setVisibility(View.VISIBLE);
+                ivPauseOverlay.setVisibility(View.VISIBLE);
+                progressHandler.removeCallbacks(updateProgressTask);
             } else {
                 ivAlbumArt.setAlpha(ThemeManager.isClassicTheme() ? 1f : 0.4f);
                 ivPauseOverlay.setVisibility(ThemeManager.isClassicTheme() ? View.GONE : View.VISIBLE);
+                if (viewCoverDim != null) viewCoverDim.setVisibility(View.GONE);
                 progressHandler.removeCallbacks(updateProgressTask);
             }
             // 🚀 [신규 추가] 반사 이미지가 항상 현재 앨범 커버와 같은 그림을 보여주도록 동기화!
@@ -12672,6 +12971,7 @@ public class MainActivity extends Activity {
             }
 
             updateGlobalStatusPlayIcon();
+            syncSpectrum();
             updatePlayerStatusIndicators(); // 💡 에러가 났던 그 함수! (이제 정상 작동합니다)
             // 🚀 [차량 블루투스 연동] 곡 정보와 재생/정지 상태를 실시간으로 차량에 쏴줍니다!
             sendBluetoothMetaToCar();
@@ -12742,9 +13042,10 @@ public class MainActivity extends Activity {
         // 🚀 [iPod 스타일] Now Playing 화면에서는 떠다니는 팝업 대신, Progress 바와 같은 모양의 인라인 게이지로 표시!
         if (currentScreenState == STATE_PLAYER && rowPlayerVolume != null) {
             rowPlayerProgress.setVisibility(View.GONE);
-            rowPlayerSeek.setVisibility(View.GONE);
-            rowPlayerShuffleRepeat.setVisibility(View.GONE);
-            rowPlayerRatingScrub.setVisibility(View.GONE);
+            // В плоской теме громкость встаёт на место строки времени, полоса прогресса остаётся;
+            // INVISIBLE, а не GONE, чтобы низ не прыгал по вертикали.
+            if (ThemeManager.isFlatTheme() && rowPlayerFlatTimes != null)
+                rowPlayerFlatTimes.setVisibility(View.INVISIBLE);
             rowPlayerVolume.setVisibility(View.VISIBLE);
             playerVolumeProgress.setProgress(currentVol);
             volumeHandler.removeCallbacks(hideNowPlayingVolumeTask);
@@ -12769,43 +13070,11 @@ public class MainActivity extends Activity {
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         resetBacklightTimer(); // 🚀 [iPod 스타일] 아무 키나 누르면 백라이트 타이머를 처음부터 다시 시작!
 
-        // 🚀 [신규 추가] Music Quiz 화면은 다른 화면들의 복잡한 분기(볼륨/커버플로우 등)에 절대 섞이지 않도록
-        // 완전히 독립적인 자체 키 핸들러를 최우선으로 둡니다. (휠 위/아래로 4지선다 이동 + 확인 + 뒤로가기)
+        // Игра не смешивается с ветками других экранов (громкость, cover flow): колесо ходит по кругу
+        // по кнопкам текущего экрана игры, остальные клавиши глотаются.
         if (currentScreenState == STATE_MUSIC_QUIZ) {
-            if (keyCode == 21) { // 휠 위로
-                View c = getCurrentFocus();
-                if (c != null && containerQuizItems != null && c.getParent() == containerQuizItems) {
-                    int idx = containerQuizItems.indexOfChild(c);
-                    for (int i = idx - 1; i >= 0; i--) {
-                        View n = containerQuizItems.getChildAt(i);
-                        if (n != null && n.getVisibility() == View.VISIBLE && n.isFocusable()) {
-                            n.requestFocus();
-                            clickFeedback();
-                            break;
-                        }
-                    }
-                }
-                return true;
-            }
-            if (keyCode == 22) { // 휠 아래로
-                View c = getCurrentFocus();
-                if (c != null && containerQuizItems != null && c.getParent() == containerQuizItems) {
-                    int idx = containerQuizItems.indexOfChild(c);
-                    for (int i = idx + 1; i < containerQuizItems.getChildCount(); i++) {
-                        View n = containerQuizItems.getChildAt(i);
-                        if (n != null && n.getVisibility() == View.VISIBLE && n.isFocusable()) {
-                            n.requestFocus();
-                            clickFeedback();
-                            break;
-                        }
-                    }
-                }
-                return true;
-            }
-            if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
-                View c = getCurrentFocus();
-                if (c != null)
-                    c.performClick();
+            if (keyCode == 21 || keyCode == 22) { // 21 — колесо против часовой, 22 — по часовой
+                moveQuizFocus(keyCode == 21 ? -1 : 1);
                 return true;
             }
             if (keyCode == KeyEvent.KEYCODE_BACK) {
@@ -12813,6 +13082,16 @@ public class MainActivity extends Activity {
                 return true;
             }
             return true; // 🚨 이 화면에서는 다른 어떤 키도 볼륨 조절 등 엉뚱한 동작으로 새지 않도록 완전 차단!
+        }
+
+        // Читалка: колесо листает книги или меняет скорость, Назад выходит на шаг; остальное глотаем.
+        if (currentScreenState == STATE_READER_LIST || currentScreenState == STATE_READER) {
+            if (keyCode == 21 || keyCode == 22) {
+                readerController.onWheel(keyCode == 21 ? -1 : 1);
+            } else if (keyCode == KeyEvent.KEYCODE_BACK) {
+                readerController.onBack();
+            }
+            return true;
         }
 
         // [🟢 onKeyDown 함수 시작 부분에 최우선적으로 추가!]
@@ -12891,35 +13170,13 @@ public class MainActivity extends Activity {
                     }
                     return true;
                 }
-                if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88) {
+                if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88
+                        || keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87) {
                     if (event.getRepeatCount() == 0) {
                         event.startTracking();
                         isSeekPerformed = false;
                     } else {
-                        long now = System.currentTimeMillis();
-                        if (now - lastSeekTime > 300) {
-                            isSeekPerformed = true;
-                            lastSeekTime = now;
-                            com.themoon.y1.managers.AudioPlayerManager.getInstance().seekRelative(-10000); // -10초 점프
-                            clickFeedback();
-                        }
-                    }
-                    return true;
-                }
-                if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87) {
-
-                    if (event.getRepeatCount() == 0) {
-                        event.startTracking(); // 감시 시작
-                        isSeekPerformed = false;
-                    } else {
-                        // 🚀 버튼을 떼지 않고 계속 꾹 누르고 있을 때 (0.3초마다 10초씩 계속 점프!)
-                        long now = System.currentTimeMillis();
-                        if (now - lastSeekTime > 300) {
-                            isSeekPerformed = true;
-                            lastSeekTime = now;
-                            com.themoon.y1.managers.AudioPlayerManager.getInstance().seekRelative(10000); // +10초 점프
-                            clickFeedback(); // 드르륵 거리는 햅틱 반응
-                        }
+                        seekHoldStep(event, keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87, false);
                     }
                     return true;
                 }
@@ -12948,36 +13205,15 @@ public class MainActivity extends Activity {
             return true;
         }
 
-        if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87) {
-            // 버튼을 처음 눌렀을 때
-            if (event.getRepeatCount() == 0) {
-                event.startTracking(); // 감시 시작
-                isSeekPerformed = false;
-            } else {
-                // 🚀 버튼을 떼지 않고 계속 꾹 누르고 있을 때 (0.3초마다 10초씩 계속 점프!)
-                long now = System.currentTimeMillis();
-                if (now - lastSeekTime > 300) {
-                    isSeekPerformed = true;
-                    lastSeekTime = now;
-                    com.themoon.y1.managers.AudioPlayerManager.getInstance().seekRelative(10000); // +10초 점프
-                    clickFeedback(); // 드르륵 거리는 햅틱 반응
-                }
-            }
-            return true;
-        }
-
-        if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88) {
+        if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87
+                || keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88) {
             if (event.getRepeatCount() == 0) {
                 event.startTracking();
                 isSeekPerformed = false;
             } else {
-                long now = System.currentTimeMillis();
-                if (now - lastSeekTime > 300) {
-                    isSeekPerformed = true;
-                    lastSeekTime = now;
-                    com.themoon.y1.managers.AudioPlayerManager.getInstance().seekRelative(-10000); // -10초 점프
-                    clickFeedback();
-                }
+                // На экране плеера цель перемотки копится на полосе, звук прыгает один раз при отпускании.
+                seekHoldStep(event, keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87,
+                        currentScreenState == STATE_PLAYER);
             }
             return true;
         }
@@ -13029,6 +13265,16 @@ public class MainActivity extends Activity {
             }
 
             if (keyCode == KeyEvent.KEYCODE_BACK) {
+                if (lyricsSyncMode) {
+                    clickFeedback();
+                    cancelLyricsSync();
+                    return true;
+                }
+                if (lyricsFullShown()) {
+                    clickFeedback();
+                    closeFullscreenLyrics();
+                    return true;
+                }
                 // 🚀 [복귀 경로 지정] 무조건 브라우저가 아니라, 방금 출발했던 화면으로 정확히 돌아갑니다!
                 changeScreen(backTargetForPlayer);
                 clickFeedback();
@@ -13678,6 +13924,7 @@ public class MainActivity extends Activity {
 
     private void unlockScreenNow() {
         inputLocked = false;
+        syncSpectrum();
         lockedTapCount = 0;
         unlockedAtMs = android.os.SystemClock.uptimeMillis();
         if (lockScreenNotice != null) lockScreenNotice.setVisibility(View.GONE);
@@ -13688,7 +13935,6 @@ public class MainActivity extends Activity {
                 "zeny:unlock");
         wake.acquire(1000);
         resetBacklightTimer();
-        Y1Toast.makeText(MainActivity.this, t("Unlocked"), Toast.LENGTH_SHORT).show();
         showUsbScreenIfNeeded();
     }
 
@@ -13867,33 +14113,13 @@ public class MainActivity extends Activity {
                     }
                     return true;
                 }
-                if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88) {
+                if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88
+                        || keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87) {
                     if (event.getRepeatCount() == 0) {
                         event.startTracking();
                         isSeekPerformed = false;
                     } else {
-                        long now = System.currentTimeMillis();
-                        if (now - lastSeekTime > 300) {
-                            isSeekPerformed = true;
-                            lastSeekTime = now;
-                            com.themoon.y1.managers.AudioPlayerManager.getInstance().seekRelative(-10000);
-                            clickFeedback();
-                        }
-                    }
-                    return true;
-                }
-                if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87) {
-                    if (event.getRepeatCount() == 0) {
-                        event.startTracking();
-                        isSeekPerformed = false;
-                    } else {
-                        long now = System.currentTimeMillis();
-                        if (now - lastSeekTime > 300) {
-                            isSeekPerformed = true;
-                            lastSeekTime = now;
-                            com.themoon.y1.managers.AudioPlayerManager.getInstance().seekRelative(10000);
-                            clickFeedback();
-                        }
+                        seekHoldStep(event, keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87, false);
                     }
                     return true;
                 }
@@ -13902,6 +14128,56 @@ public class MainActivity extends Activity {
                 }
             }
             return true;
+        }
+
+        // Медиаклавиши в читалке не переключают треки и не открывают меню музыки: PLAY тут читает,
+        // удержание открывает меню книги, NEXT/PREV перематывают текст.
+        if (currentScreenState == STATE_READER_LIST || currentScreenState == STATE_READER) {
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE) {
+                if (action == KeyEvent.ACTION_DOWN) {
+                    if (!isBottomButtonDown) {
+                        isBottomButtonDown = true;
+                        bottomButtonDownTime = System.currentTimeMillis();
+                        isMediaLongPressConsumed = false;
+                    } else if (System.currentTimeMillis() - bottomButtonDownTime > 500 && !isMediaLongPressConsumed) {
+                        isMediaLongPressConsumed = true;
+                        clickFeedback();
+                        readerController.onPlayHold();
+                    }
+                } else if (action == KeyEvent.ACTION_UP) {
+                    isBottomButtonDown = false;
+                    boolean wasHold = isMediaLongPressConsumed;
+                    isMediaLongPressConsumed = false;
+                    if (!wasHold && !event.isCanceled()) readerController.onPlayShort();
+                }
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
+                readerController.onNextPrev(keyCode == KeyEvent.KEYCODE_MEDIA_NEXT, action, event.getRepeatCount(),
+                        event.isCanceled());
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_STOP || keyCode == KeyEvent.KEYCODE_HEADSETHOOK) {
+                return true;
+            }
+        }
+
+        // Медиаклавиши в игре управляют отрывком, а не главным плеером: общий обработчик ниже и onKeyUp
+        // запустили бы или переключили музыку под игрой. Глотаем оба фронта, как для видео.
+        if (currentScreenState == STATE_MUSIC_QUIZ) {
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE) {
+                if (action == KeyEvent.ACTION_UP && !event.isCanceled()) onQuizMediaKey(keyCode);
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_NEXT) {
+                if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) onQuizMediaKey(keyCode);
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == KeyEvent.KEYCODE_MEDIA_STOP) {
+                return true;
+            }
         }
 
         // =======================================================
@@ -13968,22 +14244,14 @@ public class MainActivity extends Activity {
                     clickFeedback();
 
                     if (currentScreenState == STATE_PLAYER && currentIndex >= 0 && currentIndex < currentPlaylist.size()) {
-                        showNowPlayingContextMenu(currentPlaylist.get(currentIndex));
-                    } else if (currentScreenState == STATE_BROWSER && hzIndexScroll != null) {
-                        if (currentScrollIndexList != null && !currentScrollIndexList.isEmpty()) {
-                            // 💡 [핵심 수정] 이미 떠 있으면 숨기고, 안 떠 있으면 켭니다!
-                            if (hzIndexScroll.getVisibility() == View.VISIBLE) {
-                                hzIndexScroll.setVisibility(View.GONE);
-                                // 팝업이 꺼지면 원래 있던 노래 리스트로 포커스 복귀!
-                                if (listVirtualSongs != null) {
-                                    listVirtualSongs.requestFocus();
-                                }
-                            } else {
-                                hzIndexScroll.setVisibility(View.VISIBLE);
-                                if (layoutIndexContainer != null && layoutIndexContainer.getChildCount() > 0) {
-                                    layoutIndexContainer.getChildAt(0).requestFocus();
-                                }
-                            }
+                        // В режиме подгонки текста меню не нужно: колесо и центр заняты сдвигом.
+                        if (!lyricsSyncMode) showNowPlayingContextMenu(currentPlaylist.get(currentIndex));
+                    } else if (currentScreenState == STATE_BROWSER) {
+                        File focusedSong = focusedBrowserSongFile();
+                        if (focusedSong != null) {
+                            showSongListTrackMenu(focusedSong);
+                        } else {
+                            toggleAlphabetQuickScroll();
                         }
                     }
                     // else if (currentScreenState == STATE_PLAYER) {
@@ -14030,6 +14298,13 @@ public class MainActivity extends Activity {
         boolean isWakingUp = !isScreenOn || ((event.getFlags() & KeyEvent.FLAG_WOKE_HERE) != 0)
                 || (System.currentTimeMillis() - lastScreenOnTime < 500);
 
+        // Отпускание после удержания завершает перемотку даже при погасшем экране,
+        // иначе полоса осталась бы толстой, а звук не перешёл бы к цели.
+        if ((keyCode == KeyEvent.KEYCODE_MEDIA_NEXT || keyCode == 87
+                || keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88) && isSeekPerformed) {
+            finishSeekHold();
+        }
+
         if (isWakingUp) {
             return true;
         }
@@ -14053,26 +14328,9 @@ public class MainActivity extends Activity {
                     clickFeedback();
                     return true; // 💡 아래의 일반 숏클릭 동작으로 신호가 새어나가지 않게 여기서 완벽히 파쇄!
                 }
-                // 🚀 [지능형 숏클릭 분기] 플레이어 화면에서는 롱프레스를 화면 끄기에 양보했으므로,
-                // 즐겨찾기(♥) 등록을 '더블 클릭(따닥!)' 엔진으로 우아하게 구출합니다!
-                if (currentScreenState == STATE_PLAYER) {
-                    long now = System.currentTimeMillis();
-                    if (now - lastCenterUpTime < 300) {
-                        doubleClickHandler.removeCallbacks(singleClickRunnable);
-                        lastCenterUpTime = 0; // 타이머 초기화
-                        clickFeedback();
-                        toggleFavorite(); // 따닥 누르면 즐겨찾기 추가/해제!
-                    } else {
-                        lastCenterUpTime = now;
-                        doubleClickHandler.postDelayed(singleClickRunnable, 300);
-                    }
-                } else {
-                    // 🚀 그 외의 모든 화면(메인 메뉴 선택, 설정 로직, 라이브러리 목록 등)에서는
-                    // 0.3초 대기 시간 없이 즉시 100% 원터치 광속 클릭이 작동하여 답답함을 완전히 없앱니다!
-                    try {
-                        handleCenterShortClick();
-                    } catch (Exception e) {
-                    }
+                try {
+                    handleCenterShortClick();
+                } catch (Exception e) {
                 }
             }
             return true;
@@ -14137,7 +14395,7 @@ public class MainActivity extends Activity {
                     tuneToNextSavedRadioChannel(true);
                 } else {
                     // 🚀 [챕터 스킵 닌자 가동] 챕터/가사 창이 열려있다면 곡 넘기기 대신 '다음 챕터 워프' 가동!
-                    if (isVisualizerShowing && lyricTimestamps != null && !lyricTimestamps.isEmpty()) {
+                    if (lyricWarpActive()) {
                         int currentPos = com.themoon.y1.managers.AudioPlayerManager.getInstance().getCurrentPosition();
                         int targetMs = -1;
                         for (int i = 0; i < lyricTimestamps.size(); i++) {
@@ -14167,7 +14425,7 @@ public class MainActivity extends Activity {
                     tuneToNextSavedRadioChannel(false);
                 } else {
                     // 🚀 [챕터 스킵 닌자 가동] 챕터/가사 창이 열려있다면 '이전 챕터 워프' 가동!
-                    if (isVisualizerShowing && lyricTimestamps != null && !lyricTimestamps.isEmpty()) {
+                    if (lyricWarpActive()) {
                         int currentPos = com.themoon.y1.managers.AudioPlayerManager.getInstance().getCurrentPosition();
                         int targetMs = -1;
                         for (int i = lyricTimestamps.size() - 1; i >= 0; i--) {
@@ -14245,11 +14503,14 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         centerGestureHandler.removeCallbacksAndMessages(null);
+        saveQuizRecords();
+        releaseQuizAudio();
         if (webServer != null) webServer.stopServer();
         clockHandler.removeCallbacks(clockTask);
         progressHandler.removeCallbacks(updateProgressTask);
         volumeHandler.removeCallbacks(hideVolumeTask);
         volumeHandler.removeCallbacks(hideNowPlayingVolumeTask);
+        sleepHandler.removeCallbacks(sleepTick);
 
         // 🚀 [웹 서버 자물쇠 해제] 앱이 종료될 때 시스템 잠금 좀비 버그가 걸리지 않도록 확실하게 풀어줍니다.
         try {
@@ -14522,6 +14783,7 @@ public class MainActivity extends Activity {
                     .remove("zeny_natural_enabled")
                     .remove("video_stretch_fill")
                     .remove("album_tilt_enabled")
+                    .remove("lyrics_fullscreen_default")
                     .remove("backlight_timer_index")
                     .remove("unlock_mode")
                     .remove("screen_off_control")
@@ -14541,6 +14803,7 @@ public class MainActivity extends Activity {
         isSoundCheckEnabled = true;
         isZenyNaturalEnabled = true;
         isAlbumTiltEnabled = false;
+        isLyricsFullscreenDefault = false;
         com.themoon.y1.managers.AudioEffectManager.getInstance().applyAudioEffects();
         backlightTimerIndex = 3;
         unlockMode = UNLOCK_EITHER;
@@ -14671,6 +14934,11 @@ public class MainActivity extends Activity {
 
                     int keyCode = event.getKeyCode();
 
+                    // В игре те же физические кнопки уже обработал dispatchKeyEvent; здесь они
+                    // переключили бы главный плеер под отрывком.
+                    if (MainActivity.instance.currentScreenState == STATE_MUSIC_QUIZ)
+                        return;
+
                     // ⏮ 이전 곡 버튼 (비디오 재생 화면에서는 dispatchKeyEvent가 -10초 탐색으로 이미 처리하므로 무시)
                     if (keyCode == KeyEvent.KEYCODE_MEDIA_PREVIOUS || keyCode == 88) {
                         if (MainActivity.instance.currentScreenState == STATE_VIDEO_PLAYER) {
@@ -14747,15 +15015,6 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 currentAlbumColor = ThemeManager.getListButtonFocusedBg() | 0xFF000000;
             }
-
-            // 뒷배경 블러 처리
-            BitmapFactory.Options optsBg = new BitmapFactory.Options();
-            optsBg.inSampleSize = 4;
-            Bitmap sourceBg = BitmapFactory.decodeFile(imagePath, optsBg);
-            Bitmap blurredBg = applyGaussianBlur(sourceBg);
-            ivPlayerBgBlur.setImageBitmap(blurredBg);
-            if (sourceBg != blurredBg)
-                sourceBg.recycle();
 
             // 메인 메뉴 배경도 연동하기 위해 파일 데이터를 byte[]로 변환해서 lastAlbumArtBytes에 집어넣습니다!
             File file = new File(imagePath);
@@ -14966,7 +15225,7 @@ public class MainActivity extends Activity {
 
     // 💡 [수정] 속이 꽉 찬 리얼 파이(Pie) 차트 클래스
 
-    private static final String FONT_KEEP_TAG = "keep_font";
+    public static final String FONT_KEEP_TAG = "keep_font";
 
     // 💡 [추가] 화면에 존재하는 모든 글씨를 찾아내 테마 폰트로 갈아입히는 재귀 엔진!
     private void applyFontToAllViews(ViewGroup parent, Typeface font) {
@@ -16244,6 +16503,23 @@ public class MainActivity extends Activity {
     }
 
     // 🚀 [iPod 스타일] Now Playing 화면 길게 누르면 뜨는 곡 컨텍스트 메뉴 (실제 iPod Classic 메뉴 순서/구성과 동일)
+    private String shuffleMenuLabel() {
+        return t(isShuffleMode ? "Shuffle: On" : "Shuffle: Off");
+    }
+
+    private String repeatMenuLabel() {
+        // repeatMode: 0 выключен, 1 один трек, 2 весь список.
+        return t(repeatMode == 1 ? "Repeat: One" : (repeatMode == 2 ? "Repeat: All" : "Repeat: Off"));
+    }
+
+    /** Подпись строки из createListButtonWithIcon: текст стоит вторым ребёнком, после скрытой иконки. */
+    private static void setListButtonLabel(View row, String label) {
+        if (row instanceof ViewGroup && ((ViewGroup) row).getChildCount() > 1
+                && ((ViewGroup) row).getChildAt(1) instanceof TextView) {
+            ((TextView) ((ViewGroup) row).getChildAt(1)).setText(label);
+        }
+    }
+
     public void showNowPlayingContextMenu(final File songFile) {
         SongItem match = null;
         List<SongItem> lib = isAudiobookLibraryMode ? audiobookLibrary : customLibrary;
@@ -16307,9 +16583,38 @@ public class MainActivity extends Activity {
         btnFavorite.setOnClickListener(v -> {
             clickFeedback();
             dialog.dismiss();
-            toggleFavorite();
+            toggleFavorite(true);
         });
         layout.addView(btnFavorite);
+
+        // Режимы переключаются, не закрывая диалог: подпись строки меняется на месте,
+        // глифы в строке состояния обновляет сам toggleShuffleMode/cycleRepeatMode.
+        final View btnShuffle = createListButtonWithIcon("", shuffleMenuLabel());
+        btnShuffle.setOnKeyListener(dialogWheelListener);
+        btnShuffle.setOnClickListener(v -> {
+            clickFeedback();
+            toggleShuffleMode();
+            setListButtonLabel(btnShuffle, shuffleMenuLabel());
+        });
+        layout.addView(btnShuffle);
+
+        final View btnRepeat = createListButtonWithIcon("", repeatMenuLabel());
+        btnRepeat.setOnKeyListener(dialogWheelListener);
+        btnRepeat.setOnClickListener(v -> {
+            clickFeedback();
+            cycleRepeatMode();
+            setListButtonLabel(btnRepeat, repeatMenuLabel());
+        });
+        layout.addView(btnRepeat);
+
+        final View btnSleep = createListButtonWithIcon("", sleepMenuLabel());
+        btnSleep.setOnKeyListener(dialogWheelListener);
+        btnSleep.setOnClickListener(v -> {
+            clickFeedback();
+            cycleSleepTimer();
+            setListButtonLabel(btnSleep, sleepMenuLabel());
+        });
+        layout.addView(btnSleep);
 
         View btnOnTheGo = createListButtonWithIcon("", t("Add to On-The-Go"));
         btnOnTheGo.setOnKeyListener(dialogWheelListener);
@@ -16349,14 +16654,43 @@ public class MainActivity extends Activity {
             layout.addView(btnArtist);
         }
 
-        View btnVisualizer = createListButtonWithIcon("", t("Toggle Visualizer"));
-        btnVisualizer.setOnKeyListener(dialogWheelListener);
-        btnVisualizer.setOnClickListener(v -> {
-            clickFeedback();
-            dialog.dismiss();
-            toggleVisualizer();
-        });
-        layout.addView(btnVisualizer);
+        // В плоской теме спектр виден всегда, поэтому пункт остаётся только для текста песни, и только если он есть.
+        boolean flatTheme = ThemeManager.isFlatTheme();
+        boolean hasLyricsNow = flatTheme ? lyricsDoc != null : (!currentLyrics.isEmpty() || plainLyrics != null);
+        if (!flatTheme || hasLyricsNow) {
+            View btnVisualizer = createListButtonWithIcon("", t(flatTheme ? "Lyrics" : "Toggle Visualizer"));
+            btnVisualizer.setOnKeyListener(dialogWheelListener);
+            btnVisualizer.setOnClickListener(v -> {
+                clickFeedback();
+                dialog.dismiss();
+                toggleVisualizer();
+            });
+            layout.addView(btnVisualizer);
+        }
+
+        // Сдвиг имеет смысл только для синхронного текста: у обычного нет временных меток.
+        if (flatTheme && lyricsDoc != null && lyricsDoc.synced && !lyricsAreChapters) {
+            View btnLyricsSync = createListButtonWithIcon("", t("Lyrics sync") + ": " + lyricsShiftText(lyricsShiftMs));
+            btnLyricsSync.setOnKeyListener(dialogWheelListener);
+            btnLyricsSync.setOnClickListener(v -> {
+                clickFeedback();
+                dialog.dismiss();
+                startLyricsSync();
+            });
+            layout.addView(btnLyricsSync);
+        }
+
+        // Удалять разрешено только внутри Music: книги и подкасты вне зоны действия ластика.
+        if (TrackEraser.canErase(songFile, rootFolder)) {
+            View btnDelete = createListButtonWithIcon("", t("Delete track"), FIRE_RED);
+            btnDelete.setOnKeyListener(dialogWheelListener);
+            btnDelete.setOnClickListener(v -> {
+                clickFeedback();
+                dialog.dismiss();
+                confirmDeleteTrack(songFile);
+            });
+            layout.addView(btnDelete);
+        }
 
         View btnCancel = createListButtonWithIcon("", t("Cancel"));
         btnCancel.setOnKeyListener(dialogWheelListener);
@@ -16365,6 +16699,9 @@ public class MainActivity extends Activity {
             dialog.dismiss();
         });
         layout.addView(btnCancel);
+
+        // Меню открывается, пока PLAY ещё зажат: см. swallowMediaKeys.
+        swallowMediaKeys(dialog);
 
         dialog.show();
 
@@ -16375,6 +16712,595 @@ public class MainActivity extends Activity {
                     layout.getChildAt(0).requestFocus();
             }
         }, 50);
+    }
+
+    // =======================================================
+    // Полное удаление трека и метки удалённого (Y1_Deleted/deleted.json)
+    // =======================================================
+    private static final int FIRE_RED = 0xFF971D1C;
+
+    private File deletedMarksFile() {
+        return new File(Y1Paths.SD + "/Y1_Deleted/deleted.json");
+    }
+
+    /** Подпись справа в настройках: число меток и стрелка; без меток только стрелка, как у соседних строк. */
+    private String deletedTracksCountLabel() {
+        int n = DeletedMarks.load(deletedMarksFile()).size();
+        return n > 0 ? n + " 〉" : "〉 ";
+    }
+
+    // =======================================================
+    // Ручной сдвиг синхронного текста
+    // =======================================================
+    private static final String LYRICS_SHIFT_KEY_PREFIX = "lyrics_shift_";
+
+    /** Русская запятая в десятичной дроби, точка только для английского интерфейса (единица "s"). */
+    private String lyricsShiftText(int ms) {
+        String unit = t("s");
+        return LyricsShift.format(ms, "s".equals(unit) ? '.' : ',', unit);
+    }
+
+    private File currentLyricsTrack() {
+        if (currentIndex < 0 || currentIndex >= currentPlaylist.size()) return null;
+        return currentPlaylist.get(currentIndex);
+    }
+
+    private void updateLyricsSyncOverlay() {
+        if (lyricsFull == null) return;
+        if (lyricsSyncMode) lyricsFull.setSyncOverlay(lyricsShiftText(lyricsShiftMs),
+                t("Wheel: shift. Centre: save. Back: cancel"));
+        else lyricsFull.setSyncOverlay(null, null);
+        // Полоса прогресса и время плоского плеера лежат поверх полноэкранного текста там же, где
+        // рисуются значение сдвига и подсказка (y 306 и 338): пока идёт подгонка, низ плеера скрыт,
+        // иначе он перекрывает их. В классических темах он и так скрыт.
+        if (layoutPlayerFlatBottom != null && ThemeManager.isFlatTheme()) {
+            layoutPlayerFlatBottom.setVisibility(lyricsSyncMode ? View.GONE : View.VISIBLE);
+        }
+    }
+
+    /** Открывает полноэкранный синхронный текст в режиме подгонки; музыка продолжает играть. */
+    private void startLyricsSync() {
+        if (lyricsDoc == null || !lyricsDoc.synced || currentScreenState != STATE_PLAYER) return;
+        lyricsShiftSaved = lyricsShiftMs;
+        lyricsSyncMode = true;
+        isVisualizerShowing = true;
+        refreshVisualizerState();
+        updateLyricsSyncOverlay();
+        updateLyricsNow();
+    }
+
+    private void stepLyricsSync(boolean later) {
+        int next = LyricsShift.step(lyricsShiftMs, later ? 1 : -1);
+        if (next == lyricsShiftMs) return;
+        lyricsShiftMs = next;
+        updateLyricsSyncOverlay();
+        // Строка должна перескочить сразу, не дожидаясь тика в 250 мс (на паузе тика нет вовсе).
+        updateLyricsNow();
+    }
+
+    private void saveLyricsSync() {
+        File track = currentLyricsTrack();
+        lyricsSyncMode = false;
+        if (track != null) {
+            String key = LYRICS_SHIFT_KEY_PREFIX + track.getAbsolutePath();
+            if (lyricsShiftMs == 0) prefs.edit().remove(key).apply();
+            else prefs.edit().putInt(key, lyricsShiftMs).apply();
+        }
+        updateLyricsSyncOverlay();
+    }
+
+    private void cancelLyricsSync() {
+        if (!lyricsSyncMode) return;
+        lyricsShiftMs = lyricsShiftSaved;
+        lyricsSyncMode = false;
+        updateLyricsSyncOverlay();
+        updateLyricsNow();
+    }
+
+    /**
+     * Окно открыто зажатой PLAY: отпускание и повторы клавиши приходят уже в окно диалога, а не в
+     * dispatchKeyEvent активности, и необработанная медиаклавиша уходит системе, которая переключает
+     * воспроизведение. Глотаем их сами и сбрасываем флаги удержания, иначе следующее короткое
+     * нажатие PLAY съедится как продолжение старого удержания.
+     */
+    private void swallowMediaKeys(AlertDialog dialog) {
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            boolean mediaKey = keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY || keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_STOP || keyCode == KeyEvent.KEYCODE_HEADSETHOOK;
+            if (!mediaKey) return false;
+            if (event.getAction() == KeyEvent.ACTION_UP) {
+                isBottomButtonDown = false;
+                isMediaLongPressConsumed = false;
+            }
+            return true;
+        });
+    }
+
+    /** Колесо двигает фокус по фокусируемым строкам списка диалога. */
+    private View.OnKeyListener newDialogWheelListener(final LinearLayout layout) {
+        return new View.OnKeyListener() {
+            @Override
+            public boolean onKey(View v, int keyCode, KeyEvent event) {
+                if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+                int step = (keyCode == 21 || keyCode == 19) ? -1 : ((keyCode == 22 || keyCode == 20) ? 1 : 0);
+                if (step == 0) return false;
+                for (int i = layout.indexOfChild(v) + step; i >= 0 && i < layout.getChildCount(); i += step) {
+                    if (layout.getChildAt(i).isFocusable()) {
+                        layout.getChildAt(i).requestFocus();
+                        clickFeedback();
+                        return true;
+                    }
+                }
+                return true;
+            }
+        };
+    }
+
+    private TextView newDialogText(String text, float sp, Typeface face, int color) {
+        float d = getResources().getDisplayMetrics().density;
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(sp);
+        tv.setTypeface(face);
+        tv.setTextColor(color);
+        tv.setPadding((int) (8 * d), (int) (2 * d), (int) (8 * d), (int) (6 * d));
+        return tv;
+    }
+
+    /**
+     * Подтверждение в плоском стиле остальных диалогов. Фокус по умолчанию на «Отмена»: удаление
+     * необратимо, случайный центр не должен его запускать.
+     */
+    private void showConfirmDialog(String title, String name, String artist, String note, String confirmLabel,
+            int confirmColor, final Runnable onConfirm) {
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setBackgroundColor(0xFFFFFFFF);
+        final LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        scrollView.addView(layout);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setView(scrollView).create();
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        styleDialogCard(dialog, scrollView, layout);
+
+        int primary = ThemeManager.getTextColorPrimary();
+        int muted = ThemeManager.getTextColorSecondary();
+        layout.addView(newDialogText(title, 17f, ThemeManager.getCustomFontTitle(), primary));
+        layout.addView(newDialogText(name, 15f, ThemeManager.getCustomFontBold(), primary));
+        if (artist != null && !artist.isEmpty()) {
+            layout.addView(newDialogText(artist, 13f, ThemeManager.getCustomFont(), muted));
+        }
+        layout.addView(newDialogText(note, 13f, ThemeManager.getCustomFont(), muted));
+
+        View.OnKeyListener wheel = newDialogWheelListener(layout);
+        final View btnCancel = createListButtonWithIcon("", t("Cancel"));
+        btnCancel.setOnKeyListener(wheel);
+        btnCancel.setOnClickListener(v -> {
+            clickFeedback();
+            dialog.dismiss();
+        });
+        layout.addView(btnCancel);
+
+        View btnConfirm = createListButtonWithIcon("", confirmLabel, confirmColor);
+        btnConfirm.setOnKeyListener(wheel);
+        btnConfirm.setOnClickListener(v -> {
+            clickFeedback();
+            dialog.dismiss();
+            onConfirm.run();
+        });
+        layout.addView(btnConfirm);
+
+        swallowMediaKeys(dialog);
+        dialog.show();
+        layout.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                btnCancel.requestFocus();
+            }
+        }, 50);
+    }
+
+    /** Название и исполнитель так, как их показывает плеер; в метку идут именно они, а не имя файла. */
+    private String[] trackDisplayTags(File track) {
+        String path = track.getAbsolutePath();
+        String title = null;
+        String artist = null;
+        for (SongItem s : customLibrary) {
+            if (s.file.getAbsolutePath().equals(path)) {
+                title = s.title;
+                artist = s.artist;
+                break;
+            }
+        }
+        if (title == null || title.trim().isEmpty()) title = prefs.getString("meta_title_" + path, null);
+        if (artist == null || artist.trim().isEmpty() || artist.equalsIgnoreCase("Unknown Artist")) {
+            artist = prefs.getString("meta_artist_" + path, null);
+        }
+        if (title == null || title.trim().isEmpty()) {
+            title = track.getName();
+            int dot = title.lastIndexOf('.');
+            if (dot > 0) title = title.substring(0, dot);
+        }
+        if (artist == null || artist.equalsIgnoreCase("Unknown Artist")) artist = "";
+        return new String[] { title, artist };
+    }
+
+    private void confirmDeleteTrack(final File track) {
+        String[] tags = trackDisplayTags(track);
+        showConfirmDialog(t("Delete this track?"), tags[0], tags[1],
+                t("It disappears from the player and playlists and will not be downloaded again until you remove the mark."),
+                t("Delete"), FIRE_RED, new Runnable() {
+                    @Override
+                    public void run() {
+                        deleteTrackCompletely(track);
+                    }
+                });
+    }
+
+    /**
+     * Играющий трек сначала заменяется следующим, и только потом стирается файл: плеер держит его
+     * открытым. Если треков больше нет, воспроизведение останавливается и очередь пустеет.
+     */
+    private void switchAwayFromTrack(String path) {
+        List<File> remaining = new ArrayList<>();
+        int nextIndex = 0;
+        for (int i = 0; i < currentPlaylist.size(); i++) {
+            File f = currentPlaylist.get(i);
+            if (path.equals(f.getAbsolutePath())) continue;
+            if (i < currentIndex) nextIndex++;
+            remaining.add(f);
+        }
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        if (remaining.isEmpty()) {
+            am.stopAndClearQueue();
+            currentPlaylist.clear();
+            originalPlaylist.clear();
+            currentIndex = 0;
+            isPausedByHand = true;
+            displayedPlayerPath = null;
+            return;
+        }
+        if (nextIndex >= remaining.size()) nextIndex = 0;
+        am.playTrackList(remaining, nextIndex);
+    }
+
+    /** Убирает стёртый файл из библиотеки, избранного, очереди и кэша на диске, чтобы он не вернулся после перезапуска. */
+    private void forgetErasedTrack(String path) {
+        java.util.Iterator<SongItem> it = customLibrary.iterator();
+        while (it.hasNext()) {
+            if (it.next().file.getAbsolutePath().equals(path)) it.remove();
+        }
+        trackNumberMap.remove(path);
+        synchronized (knownDupPaths) {
+            knownDupPaths.remove(path);
+        }
+        if (favoritePaths.remove(path)) {
+            prefs.edit().putStringSet("favorites", new HashSet<>(favoritePaths)).commit();
+        }
+        prefs.edit().remove("lyrics_shift_" + path).remove("meta_title_" + path).remove("meta_artist_" + path)
+                .commit();
+
+        com.themoon.y1.managers.AudioPlayerManager am = com.themoon.y1.managers.AudioPlayerManager.getInstance();
+        for (int i = currentPlaylist.size() - 1; i >= 0; i--) {
+            if (path.equals(currentPlaylist.get(i).getAbsolutePath())) {
+                currentPlaylist.remove(i);
+                am.removeQueuedItem(i);
+                if (i < currentIndex) currentIndex--;
+            }
+        }
+        for (int i = originalPlaylist.size() - 1; i >= 0; i--) {
+            if (path.equals(originalPlaylist.get(i).getAbsolutePath())) originalPlaylist.remove(i);
+        }
+        if (currentIndex >= currentPlaylist.size()) currentIndex = Math.max(0, currentPlaylist.size() - 1);
+        saveLibraryCache();
+    }
+
+    private void writeDeletedMark(String path, String artist, String title) {
+        String cardRoot = Y1Paths.SD + "/";
+        String rel = path.startsWith(cardRoot) ? path.substring(cardRoot.length())
+                : rootFolder.getName() + "/" + path.substring(rootFolder.getAbsolutePath().length() + 1);
+        try {
+            File f = deletedMarksFile();
+            com.themoon.y1.managers.DeletedMarks marks = com.themoon.y1.managers.DeletedMarks.load(f);
+            marks.add(rel, artist, title, System.currentTimeMillis());
+            marks.save(f);
+        } catch (Exception e) {
+            // Файл уже стёрт и не воскресает: метка не записалась, компьютер может скачать трек снова.
+            android.util.Log.w("Y1Delete", "mark not written for " + rel, e);
+        }
+    }
+
+    /** Общий путь удаления для меню плеера и меню списка треков. */
+    private void deleteTrackCompletely(File track) {
+        final String path = track.getAbsolutePath();
+        if (!com.themoon.y1.managers.TrackEraser.canErase(track, rootFolder)) {
+            Y1Toast.makeText(this, t("Could not delete the track"), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String[] tags = trackDisplayTags(track);
+        boolean wasCurrent = !currentPlaylist.isEmpty() && currentIndex >= 0 && currentIndex < currentPlaylist.size()
+                && path.equals(currentPlaylist.get(currentIndex).getAbsolutePath());
+        if (wasCurrent) switchAwayFromTrack(path);
+
+        com.themoon.y1.managers.TrackEraser.Result r = com.themoon.y1.managers.TrackEraser.erase(track, rootFolder,
+                new File(Y1Paths.SD + "/Y1_Playlists"), new File(Y1Paths.SD + "/Y1_Covers"));
+        if (!r.ok) {
+            Y1Toast.makeText(this, t("Could not delete the track"), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        forgetErasedTrack(path);
+        writeDeletedMark(path, tags[1], tags[0]);
+        Y1Toast.makeText(this, t("Track deleted"), Toast.LENGTH_SHORT).show();
+
+        if (currentScreenState == STATE_PLAYER && currentPlaylist.isEmpty()) {
+            changeScreen(backTargetForPlayer);
+        } else {
+            refreshVisibleSongList();
+        }
+        try {
+            refreshNowPlayingPreview();
+        } catch (Exception ignored) {
+            // Превью главного меню не должно ломать завершённое удаление.
+        }
+    }
+
+    /** Перестраивает открытый список песен; для остальных экранов ничего не делает. */
+    private void refreshVisibleSongList() {
+        if (currentScreenState != STATE_BROWSER) return;
+        if (currentBrowserMode == BROWSER_VIRTUAL_SONGS) buildVirtualSongs();
+        else if (currentBrowserMode == BROWSER_FAVORITES) buildVirtualSongsForFavorites();
+        else if (currentBrowserMode == BROWSER_M3U_SONGS && currentM3uFile != null) buildM3uSongsUI(currentM3uFile);
+    }
+
+    /** Песня под фокусом в списке песен; null, если фокус на другой строке или список не песенный. */
+    private File focusedBrowserSongFile() {
+        if (listVirtualSongs == null || listVirtualSongs.getVisibility() != View.VISIBLE) return null;
+        if (currentBrowserMode == BROWSER_PODCAST_EPISODES || isAudiobookLibraryMode) return null;
+        if (!(listVirtualSongs.getAdapter() instanceof com.themoon.y1.adapters.SongListAdapter)) return null;
+        View row = listVirtualSongs.getFocusedChild();
+        if (row == null) return null;
+        int pos = listVirtualSongs.getPositionForView(row);
+        if (pos == android.widget.AdapterView.INVALID_POSITION) return null;
+        Object item = listVirtualSongs.getAdapter().getItem(pos);
+        return item instanceof SongItem ? ((SongItem) item).file : null;
+    }
+
+    /** Алфавитная полоса быстрого перехода: прежнее действие удержания PLAY в списках. */
+    private void toggleAlphabetQuickScroll() {
+        if (hzIndexScroll == null || currentScrollIndexList == null || currentScrollIndexList.isEmpty()) return;
+        if (hzIndexScroll.getVisibility() == View.VISIBLE) {
+            hzIndexScroll.setVisibility(View.GONE);
+            // Полоса закрыта: фокус возвращается в список песен.
+            if (listVirtualSongs != null) listVirtualSongs.requestFocus();
+        } else {
+            hzIndexScroll.setVisibility(View.VISIBLE);
+            if (layoutIndexContainer != null && layoutIndexContainer.getChildCount() > 0) {
+                layoutIndexContainer.getChildAt(0).requestFocus();
+            }
+        }
+    }
+
+    private void toggleFavoritePath(String path, boolean announce) {
+        if (favoritePaths.contains(path)) {
+            favoritePaths.remove(path);
+            if (announce) Y1Toast.makeText(this, t("Removed from Favorites."), Toast.LENGTH_SHORT).show();
+        } else {
+            favoritePaths.add(path);
+            if (announce) Y1Toast.makeText(this, t("Added to Favorites."), Toast.LENGTH_SHORT).show();
+        }
+        try {
+            prefs.edit().putStringSet("favorites", new HashSet<>(favoritePaths)).commit();
+        } catch (Exception e) {
+        }
+        updatePlayerStatusIndicators();
+    }
+
+    /** Короткое меню трека в списке песен (удержание PLAY на строке). */
+    private void showSongListTrackMenu(final File songFile) {
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setBackgroundColor(0xFFFFFFFF);
+        final LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        scrollView.addView(layout);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setView(scrollView).create();
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        styleDialogCard(dialog, scrollView, layout);
+        View.OnKeyListener wheel = newDialogWheelListener(layout);
+        final String path = songFile.getAbsolutePath();
+
+        View btnFavorite = createListButtonWithIcon("",
+                favoritePaths.contains(path) ? t("Remove from Favorites") : t("Add to Favorites"));
+        btnFavorite.setOnKeyListener(wheel);
+        btnFavorite.setOnClickListener(v -> {
+            clickFeedback();
+            dialog.dismiss();
+            toggleFavoritePath(path, true);
+            if (currentBrowserMode == BROWSER_FAVORITES) refreshVisibleSongList();
+        });
+        layout.addView(btnFavorite);
+
+        View btnOnTheGo = createListButtonWithIcon("", t("Add to On-The-Go"));
+        btnOnTheGo.setOnKeyListener(wheel);
+        btnOnTheGo.setOnClickListener(v -> {
+            clickFeedback();
+            dialog.dismiss();
+            addSongToOnTheGo(songFile);
+        });
+        layout.addView(btnOnTheGo);
+
+        // Удержание PLAY на песне раньше открывало алфавитную полосу; строка сохраняет её доступной.
+        if (currentScrollIndexList != null && !currentScrollIndexList.isEmpty()) {
+            View btnScroll = createListButtonWithIcon("", t("Quick scroll"));
+            btnScroll.setOnKeyListener(wheel);
+            btnScroll.setOnClickListener(v -> {
+                clickFeedback();
+                dialog.dismiss();
+                toggleAlphabetQuickScroll();
+            });
+            layout.addView(btnScroll);
+        }
+
+        if (com.themoon.y1.managers.TrackEraser.canErase(songFile, rootFolder)) {
+            View btnDelete = createListButtonWithIcon("", t("Delete track"), FIRE_RED);
+            btnDelete.setOnKeyListener(wheel);
+            btnDelete.setOnClickListener(v -> {
+                clickFeedback();
+                dialog.dismiss();
+                confirmDeleteTrack(songFile);
+            });
+            layout.addView(btnDelete);
+        }
+
+        View btnCancel = createListButtonWithIcon("", t("Cancel"));
+        btnCancel.setOnKeyListener(wheel);
+        btnCancel.setOnClickListener(v -> {
+            clickFeedback();
+            dialog.dismiss();
+        });
+        layout.addView(btnCancel);
+
+        swallowMediaKeys(dialog);
+        dialog.show();
+        layout.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (layout.getChildCount() > 0) layout.getChildAt(0).requestFocus();
+            }
+        }, 50);
+    }
+
+    /** Строка в две линии: название и приглушённый исполнитель под ним. */
+    private LinearLayout createTwoLineRow(String line1, String line2) {
+        final float d = getResources().getDisplayMetrics().density;
+        final LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setFocusable(true);
+        row.setClickable(true);
+        row.setSoundEffectsEnabled(false);
+        row.setBackground(createButtonBackground(ThemeManager.getListButtonNormalBg()));
+        row.setPadding((int) (8 * d), (int) (6 * d), (int) (10 * d), (int) (6 * d));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 2, 0, 2);
+        row.setLayoutParams(lp);
+
+        final TextView tv1 = new TextView(this);
+        tv1.setText(line1);
+        tv1.setSingleLine(true);
+        tv1.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        tv1.setTypeface(ThemeManager.getCustomFontBold());
+        tv1.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, ThemeManager.getListTextSize() * d);
+        tv1.setTextColor(ThemeManager.getTextColorPrimary());
+        row.addView(tv1);
+
+        final TextView tv2 = new TextView(this);
+        tv2.setText(line2);
+        tv2.setSingleLine(true);
+        tv2.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        tv2.setTypeface(ThemeManager.getCustomFont());
+        tv2.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 13f * d);
+        tv2.setTextColor(ThemeManager.getTextColorSecondary());
+        tv2.setVisibility(line2 == null || line2.isEmpty() ? View.GONE : View.VISIBLE);
+        row.addView(tv2);
+
+        row.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+            @Override
+            public void onFocusChange(View v, boolean hasFocus) {
+                if (hasFocus) {
+                    row.setBackground(createFocusedButtonBackground());
+                    tv1.setTextColor(ThemeManager.getListButtonFocusedTextColor());
+                    tv2.setTextColor(ThemeManager.getListButtonFocusedTextColor());
+                } else {
+                    row.setBackground(createButtonBackground(ThemeManager.getListButtonNormalBg()));
+                    tv1.setTextColor(ThemeManager.getTextColorPrimary());
+                    tv2.setTextColor(ThemeManager.getTextColorSecondary());
+                }
+            }
+        });
+        return row;
+    }
+
+    /** Экран «Удалённые треки»: метки новыми сверху, центр на строке предлагает снять метку. */
+    private void showDeletedTracksDialog(final Runnable afterClose) {
+        final com.themoon.y1.managers.DeletedMarks marks =
+                com.themoon.y1.managers.DeletedMarks.load(deletedMarksFile());
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setBackgroundColor(0xFFFFFFFF);
+        final LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        scrollView.addView(layout);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setView(scrollView).create();
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        styleDialogCard(dialog, scrollView, layout);
+        dialog.setOnDismissListener(d -> {
+            if (afterClose != null) afterClose.run();
+        });
+        renderDeletedRows(layout, marks, newDialogWheelListener(layout));
+        dialog.show();
+        layout.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                focusFirstRow(layout);
+            }
+        }, 50);
+    }
+
+    private static void focusFirstRow(LinearLayout layout) {
+        for (int i = 0; i < layout.getChildCount(); i++) {
+            if (layout.getChildAt(i).isFocusable()) {
+                layout.getChildAt(i).requestFocus();
+                return;
+            }
+        }
+    }
+
+    private void renderDeletedRows(final LinearLayout layout, final com.themoon.y1.managers.DeletedMarks marks,
+            final View.OnKeyListener wheel) {
+        layout.removeAllViews();
+        layout.addView(newDialogText(t("Deleted tracks"), 17f, ThemeManager.getCustomFontTitle(),
+                ThemeManager.getTextColorPrimary()));
+        List<com.themoon.y1.managers.DeletedMarks.Item> items = marks.items();
+        if (items.isEmpty()) {
+            layout.addView(newDialogText(t("No deleted tracks"), 15f, ThemeManager.getCustomFont(),
+                    ThemeManager.getTextColorSecondary()));
+            return;
+        }
+        for (int i = items.size() - 1; i >= 0; i--) {
+            final com.themoon.y1.managers.DeletedMarks.Item item = items.get(i);
+            String title = item.title;
+            if (title == null || title.isEmpty()) {
+                title = item.path.substring(item.path.lastIndexOf('/') + 1);
+            }
+            LinearLayout row = createTwoLineRow(title, item.artist);
+            row.setOnKeyListener(wheel);
+            final String shownTitle = title;
+            row.setOnClickListener(v -> {
+                clickFeedback();
+                showConfirmDialog(t("Remove the mark?"), shownTitle, item.artist,
+                        t("The track can be downloaded from the computer again. The file on the player does not come back."),
+                        t("Remove mark"), 0, new Runnable() {
+                            @Override
+                            public void run() {
+                                marks.remove(item.path);
+                                try {
+                                    marks.save(deletedMarksFile());
+                                } catch (Exception e) {
+                                    Y1Toast.makeText(MainActivity.this, t("Could not save changes"),
+                                            Toast.LENGTH_SHORT).show();
+                                }
+                                renderDeletedRows(layout, marks, wheel);
+                                focusFirstRow(layout);
+                            }
+                        });
+            });
+            layout.addView(row);
+        }
     }
 
     // 🚀 [자체 플레이리스트 엔진 4단계] 실시간 하드디스크 물리 레코딩 스트림
@@ -17051,6 +17977,7 @@ public class MainActivity extends Activity {
     // id/기본 라벨 목록 - buildFileBrowserUI()의 뮤직 모드 버튼들과 1:1로 대응됩니다.
     public static final String[][] MUSIC_MENU_ITEMS = {
             {"coverflow", "Cover Flow"},
+            {"random", "Random"},
             {"playlists", "Playlists"},
             {"track_artists", "Artists"},
             {"artists", "Album Artists"},

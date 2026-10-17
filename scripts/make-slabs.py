@@ -40,6 +40,7 @@ SURFACES = {
 CARDS = [
     ("music", "музыка", "Твоя коллекция с карты памяти", "czeef", "life"),
     ("videos", "видео", "Фильмы и клипы", "dreamy", "water"),
+    ("reader", "читалка", "Книги слово за словом", "filing", "air"),
     ("quiz", "викторина", "Угадай трек по кусочку", "target", "possible"),
     ("podcasts", "подкасты", "Слушай и качай выпуски", "focus", "fire"),
     ("radio", "радио", "Эфир без интернета", "wires", "air"),
@@ -332,6 +333,26 @@ def build_banner(name):
     print("OK", path, os.path.getsize(path))
 
 
+def build_book_cover_placeholder():
+    """Заглушка обложки книги в списке читалки: робот на плоской заливке water, 146x219 (контейнер списка).
+
+    Углы не скругляются в файле: список сам режет картинку по радиусу контейнера, как настоящую обложку.
+    """
+    w, h = 146, 219
+    fill, _ = SURFACES["water"]
+    img = Image.new("RGBA", (w * S, h * S), fill + (255,))
+    scene = robot_scene("filing")
+    width = int(w * S * 0.92)
+    scene = scene.resize((width, int(scene.height * width / scene.width)), Image.LANCZOS)
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    layer.paste(scene, ((img.width - scene.width) // 2, (img.height - scene.height) // 2))
+    img = Image.alpha_composite(img, layer).resize((w, h), Image.LANCZOS).convert("RGB")
+    path = os.path.join(DRAWABLE_NODPI, "book_cover_robot.png")
+    os.makedirs(DRAWABLE_NODPI, exist_ok=True)
+    img.save(path, optimize=True)
+    print("OK", path, os.path.getsize(path))
+
+
 def build_lock_card():
     """Экран блокировки: карточка water с роботом, спиной к камере, и наклонённая плита из-под неё."""
     sw, sh = 480, 360
@@ -392,6 +413,8 @@ def main():
             build_banner(banner)
     if not only or "lock" in only:
         build_lock_card()
+    if not only or "bookcover" in only:
+        build_book_cover_placeholder()
 
 
 if __name__ == "__main__":

@@ -176,10 +176,7 @@ public class AudioPlayerManager {
                                         MainActivity.instance.setupVisualizer();
 
                                         int duration = getDuration();
-                                        int remaining = Math.max(0, duration - getCurrentPosition());
-                                        int s = (remaining / 1000) % 60;
-                                        int m = remaining / (1000 * 60);
-                                        MainActivity.instance.tvPlayerTimeTotal.setText(String.format(Locale.US, "-%02d:%02d", m, s));
+                                        MainActivity.instance.refreshPlayerProgress(getCurrentPosition(), duration);
                                         com.themoon.y1.managers.LastFmScrobbler.getInstance(MainActivity.instance)
                                                 .onTrackStart(pendingScrobbleArtist, pendingScrobbleTitle, pendingScrobbleAlbum, duration, pendingScrobblePath);
                                         // 🚀 [추가!] 곡 장전이 끝나서 정확한 duration이 나왔으므로, 이 시점에 비트레이트 캡슐을 다시 업데이트합니다!
@@ -223,6 +220,7 @@ public class AudioPlayerManager {
 
                     main.currentIndex = newIndex;
                     main.lastTrackChangeTime = System.currentTimeMillis();
+                    if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) main.consumeEndOfTrackSleep();
                     main.runOnUiThread(() -> {
                         prepareMusicTrack(newIndex);
                         main.updatePlayerUI();
@@ -254,6 +252,25 @@ public class AudioPlayerManager {
     }
     public float getCurrentSpeed() { return currentSpeed; }
 
+    /**
+     * Таймер сна «до конца трека»: ExoPlayer сам встаёт на паузу на стыке треков, поэтому
+     * в гапless-очереди не слышно начала следующего. Флаг живёт в самом плеере и переживает
+     * смену треков; для FLAC-плеера работает проверка в handleTrackCompletion.
+     */
+    public void setEndOfTrackSleep(boolean on) {
+        if (exoPlayer != null) exoPlayer.setPauseAtEndOfMediaItems(on);
+    }
+
+    /**
+     * Множитель громкости плеера для затухания таймера сна. Системную громкость не трогаем:
+     * колесо крутит STREAM_MUSIC, и множитель с ней перемножается, так что новое значение с колеса
+     * побеждает само, а возврат к 1.0f точно восстанавливает прежний уровень.
+     */
+    public void setFadeVolume(float volume) {
+        if (exoPlayer != null) exoPlayer.setVolume(volume);
+        if (legacyPlayer != null) legacyPlayer.setVolume(volume, volume);
+    }
+
     private void handleTrackCompletion() {
         MainActivity main = MainActivity.instance;
         if (main == null) return;
@@ -266,6 +283,18 @@ public class AudioPlayerManager {
                     com.themoon.y1.managers.LastFmScrobbler.getInstance(main).evaluateAndMaybeSubmit(getCurrentPosition());
 
                     int repeatMode = main.prefs.getInt("repeat_mode", 0);
+                    if (main.consumeEndOfTrackSleep()) {
+                        // Следующий трек готовим на паузе, иначе Play после таймера упрётся в
+                        // уже закончившийся трек. В гапless-очереди плеер сам стоит на следующем.
+                        if (exoPlayer != null) exoPlayer.setPlayWhenReady(false);
+                        if (!isGaplessQueueActive && !main.currentPlaylist.isEmpty()) {
+                            main.currentIndex = repeatMode == 1 ? main.currentIndex
+                                    : (main.currentIndex + 1) % main.currentPlaylist.size();
+                            prepareMusicTrack(main.currentIndex);
+                        }
+                        main.updatePlayerUI();
+                        return;
+                    }
                     if (repeatMode == 1) {
                         if (isUsingLegacyPlayer && legacyPlayer != null) {
                             legacyPlayer.seekTo(0); legacyPlayer.start();
@@ -414,7 +443,6 @@ public class AudioPlayerManager {
                 main.tvPlayerArtist.setText(channelName); // 가수에 팟캐스트 채널명 표시
                 main.tvPlayerAlbum.setText("");
                 main.ivAlbumArt.setImageResource(R.drawable.default_album);
-                main.ivPlayerBgBlur.setImageResource(0);
                 main.updatePlayerUI();
             });
 
@@ -429,8 +457,6 @@ public class AudioPlayerManager {
                         if (bmp != null) {
                             main.runOnUiThread(() -> {
                                 main.ivAlbumArt.setImageBitmap(bmp);
-                                android.graphics.Bitmap blurredBg = main.applyGaussianBlur(bmp);
-                                main.ivPlayerBgBlur.setImageBitmap(blurredBg);
                                 main.currentAlbumColor = bmp.getPixel(bmp.getWidth()/2, (int)(bmp.getHeight()*0.8)) | 0xFF000000;
                                 main.updateMainMenuBackground();
                             });
@@ -559,6 +585,34 @@ public class AudioPlayerManager {
         main.updatePlayerUI();
     }
 
+    /**
+     * Убирает из нативной очереди ExoPlayer трек, которого уже нет на карте. Индексы очереди и
+     * списка в MainActivity совпадают только в гапless-режиме; в остальных режимах очереди нет.
+     */
+    public void removeQueuedItem(int index) {
+        if (isGaplessQueueActive && exoPlayer != null && index >= 0 && index < exoPlayer.getMediaItemCount()) {
+            exoPlayer.removeMediaItem(index);
+        }
+    }
+
+    /** Полная остановка и пустая очередь: последний трек удалён, играть больше нечего. */
+    public void stopAndClearQueue() {
+        isGaplessQueueActive = false;
+        if (exoPlayer != null) {
+            exoPlayer.setPlayWhenReady(false);
+            exoPlayer.stop();
+            exoPlayer.clearMediaItems();
+        }
+        if (legacyPlayer != null) {
+            try {
+                legacyPlayer.stop();
+                legacyPlayer.reset();
+            } catch (Exception e) {
+                // Плеер мог быть в состоянии, где stop недопустим: очередь всё равно уже пуста.
+            }
+        }
+    }
+
     public void seekRelative(int offsetMs) {
         long currentPos = getCurrentPosition();
         long duration = getDuration();
@@ -611,10 +665,7 @@ public class AudioPlayerManager {
         main.tvPlayerArtist.setText("Loading...");
         main.tvPlayerAlbum.setText("");
         main.ivAlbumArt.setImageResource(R.drawable.default_album);
-        main.ivPlayerBgBlur.setImageResource(0);
-        main.playerProgress.setProgress(0);
-        main.tvPlayerTimeCurrent.setText("00:00");
-        main.tvPlayerTimeTotal.setText("00:00");
+        main.resetPlayerProgress();
 
         String ext = track.getName().toLowerCase();
         boolean isOpus = ext.endsWith(".opus");
@@ -757,13 +808,6 @@ public class AudioPlayerManager {
                     android.graphics.Bitmap bmpCenter = android.graphics.BitmapFactory.decodeByteArray(main.lastAlbumArtBytes, 0, main.lastAlbumArtBytes.length, optsCenter);
                     main.ivAlbumArt.setImageBitmap(bmpCenter);
 
-                    android.graphics.BitmapFactory.Options optsBg = new android.graphics.BitmapFactory.Options();
-                    optsBg.inSampleSize = 4;
-                    android.graphics.Bitmap sourceBg = android.graphics.BitmapFactory.decodeByteArray(main.lastAlbumArtBytes, 0, main.lastAlbumArtBytes.length, optsBg);
-                    android.graphics.Bitmap blurredBg = main.applyGaussianBlur(sourceBg);
-                    main.ivPlayerBgBlur.setImageBitmap(blurredBg);
-                    if (sourceBg != blurredBg) sourceBg.recycle();
-
                     try {
                         int centerX = bmpCenter.getWidth() / 2;
                         int centerY = (int) (bmpCenter.getHeight() * 0.8);
@@ -794,10 +838,6 @@ public class AudioPlayerManager {
 
                     main.ivAlbumArt.setImageBitmap(bmp);
 
-                    // 4. 홀쭉해진 이미지로 배경 블러(RenderScript)를 0.05초 만에 초고속 처리!
-                    android.graphics.Bitmap blurredBg = main.applyGaussianBlur(bmp);
-                    main.ivPlayerBgBlur.setImageBitmap(blurredBg);
-
                     try {
                         int centerX = bmp.getWidth() / 2;
                         int centerY = (int) (bmp.getHeight() * 0.8);
@@ -826,7 +866,6 @@ public class AudioPlayerManager {
                     // (4순위) 다 없으면 최후의 수단으로 '기본 테마 이미지'를 띄우고 인터넷에 다운로드 명령을 내립니다!
                     main.ivAlbumArt.setImageResource(R.drawable.default_album);
                     main.currentAlbumColor = ThemeManager.getListButtonFocusedBg() | 0xFF000000;
-                    main.ivPlayerBgBlur.setImageResource(0);
                     main.updateMainMenuBackground();
                     main.refreshNowPlayingPreview();
 
@@ -892,10 +931,7 @@ public class AudioPlayerManager {
                 main.setupVisualizer();
 
                 int duration = legacyPlayer.getDuration();
-                int remaining = Math.max(0, duration - legacyPlayer.getCurrentPosition());
-                int s = (remaining / 1000) % 60;
-                int m = remaining / (1000 * 60);
-                main.tvPlayerTimeTotal.setText(String.format(Locale.US, "-%02d:%02d", m, s));
+                main.refreshPlayerProgress(legacyPlayer.getCurrentPosition(), duration);
                 com.themoon.y1.managers.LastFmScrobbler.getInstance(main)
                         .onTrackStart(pendingScrobbleArtist, pendingScrobbleTitle, pendingScrobbleAlbum, duration, pendingScrobblePath);
 
@@ -1074,7 +1110,7 @@ public class AudioPlayerManager {
 
     // Заменяет штатный LibopusAudioRenderer на вариант с 32-битным float-выходом декодера (opus_decode_float),
     // чтобы интерсемпловые пики > 0 dBFS не срезались внутри libopus до попадания в ZenyAudioProcessor.
-    private static void installFloatOpusRenderer(
+    static void installFloatOpusRenderer(
             android.os.Handler eventHandler,
             com.google.android.exoplayer2.audio.AudioRendererEventListener eventListener,
             com.google.android.exoplayer2.audio.AudioSink audioSink,
