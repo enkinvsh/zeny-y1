@@ -1,0 +1,30 @@
+# Артефакты сборки и рабочие файлы генераторов
+out/
+work/
+shots/
+android/.gradle/
+android/.idea/
+android/app/build/
+android/local.properties
+android/build/
+android/app/src/main/jniLibs/
+*.apk
+*.odex
+*.log
+
+# Бэкапы с плеера и снятое со стока: чужой код, NVRAM, серийные данные конкретного устройства
+backup/
+
+# Окружения и клоны чужих репозиториев (воспроизводятся tools/mtk/setup.sh и uv)
+**/.venv/
+tools/mtk/venv/
+tools/mtk/upd-repo/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
+# Промежуточные файлы вырезки роботов
+theme/robots/_work_*/
+theme/robots/*_preview.png
+
+.DS_Store
