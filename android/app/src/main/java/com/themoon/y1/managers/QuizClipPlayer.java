@@ -58,7 +58,6 @@ public final class QuizClipPlayer {
     private MediaPlayer media;
     // Один экземпляр на всё время игры: прежний плеер к моменту следующего prepare() уже освобождён.
     private ZenyAudioProcessor dsp;
-    private boolean dspNatural = true;
     private boolean dspSoundCheck = true;
     private Listener listener;
     // Каждая подготовка получает свой номер: колбэки уже отпущенного плеера сравнивают его и молчат.
@@ -99,8 +98,7 @@ public final class QuizClipPlayer {
      * Без неё Opus декодируется в 16 бит с жёстким срезом пиков и без выравнивания громкости: при включённом
      * Sound Check трек с тегом R128 -10 дБ играл бы на ~10 дБ громче обычного прослушивания и хрипел бы.
      */
-    public void setDspSettings(boolean zenyNatural, boolean soundCheck) {
-        dspNatural = zenyNatural;
+    public void setDspSettings(boolean soundCheck) {
         dspSoundCheck = soundCheck;
     }
 
@@ -119,7 +117,6 @@ public final class QuizClipPlayer {
 
     private void prepareExo(File file, final int gen) {
         if (dsp == null) dsp = new ZenyAudioProcessor();
-        dsp.setZenyNaturalEnabled(dspNatural);
         dsp.setSoundCheckEnabled(dspSoundCheck);
         dsp.setTrackGainDb(trackGainOf(file));
         final ZenyAudioProcessor clipDsp = dsp;

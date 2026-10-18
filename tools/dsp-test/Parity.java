@@ -113,13 +113,15 @@ public class Parity {
 
     public static void main(String[] args) throws Exception {
         System.out.println("[паритет] нативное ядро против Java");
-        compare("48k float стерео, Natural", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {});
+        compare("48k float стерео, Air 1", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setAirStep(1));
+        compare("48k float стерео, Air 5", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setAirStep(5));
         compare("48k float стерео, чанк 777", 48000, 2, C.ENCODING_PCM_FLOAT, 777, p -> {});
         compare("48k float стерео, чанк 1", 48000, 2, C.ENCODING_PCM_FLOAT, 1, p -> {});
-        compare("48k float стерео, Natural OFF", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setZenyNaturalEnabled(false));
-        compare("48k float моно, Natural", 48000, 1, C.ENCODING_PCM_FLOAT, 4096, p -> {});
+        compare("48k float стерео, Pure (по умолчанию)", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {});
+        compare("48k float моно, Air 5", 48000, 1, C.ENCODING_PCM_FLOAT, 4096, p -> p.setAirStep(5));
         compare("44.1k 16бит стерео, без ресемплинга", 44100, 2, C.ENCODING_PCM_16BIT, 4096, p -> {});
-        compare("44.1k 16бит стерео, Natural OFF", 44100, 2, C.ENCODING_PCM_16BIT, 4096, p -> p.setZenyNaturalEnabled(false));
+        compare("44.1k 16бит стерео, Air 1", 44100, 2, C.ENCODING_PCM_16BIT, 4096, p -> p.setAirStep(1));
+        compare("44.1k float стерео, Air 5", 44100, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setAirStep(5));
         compare("22.05k 16бит стерео (х2 вверх)", 22050, 2, C.ENCODING_PCM_16BIT, 1000, p -> {});
         compare("96k float стерео", 96000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {});
         compare("32k 16бит моно", 32000, 1, C.ENCODING_PCM_16BIT, 1500, p -> {});
@@ -127,23 +129,28 @@ public class Parity {
         compare("48k 32бит стерео", 48000, 2, C.ENCODING_PCM_32BIT, 4096, p -> {});
         compare("48k 8бит стерео", 48000, 2, C.ENCODING_PCM_8BIT, 4096, p -> {});
         compare("47123 Гц float (запасной путь Эрмита?)", 47123, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {});
-        compare("48k EQ полосы +6/-4", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {
-            p.setSoftwareEqEnabled(true);
-            p.setBandLevel(1, 6f);
-            p.setBandLevel(5, -4f);
-            p.setBandLevel(8, 3f);
+        compare("48k Сцена 1", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setCrossfeedStep(1));
+        compare("48k Сцена 3 + Air 2", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {
+            p.setAirStep(2);
+            p.setCrossfeedStep(3);
         });
-        compare("48k crossfeed шаг 2", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setCrossfeedStep(2));
+        compare("44.1k Сцена 1 + Air 2", 44100, 2, C.ENCODING_PCM_16BIT, 4096, p -> {
+            p.setAirStep(2);
+            p.setCrossfeedStep(1);
+        });
+        compare("44.1k Сцена 3 + Air 2", 44100, 2, C.ENCODING_PCM_16BIT, 4096, p -> {
+            p.setAirStep(2);
+            p.setCrossfeedStep(3);
+        });
+        compare("48k Сцена 2, чанк 1", 48000, 2, C.ENCODING_PCM_FLOAT, 1, p -> p.setCrossfeedStep(2));
         compare("48k SoundCheck с тегом +2.5 дБ", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> {
             p.setSoundCheckEnabled(true);
             p.setTrackGainDb(2.5f);
         });
         compare("48k SoundCheck без тега (AGC)", 48000, 2, C.ENCODING_PCM_FLOAT, 4096, p -> p.setSoundCheckEnabled(true));
-        compare("44.1k AGC + EQ + crossfeed 3", 44100, 2, C.ENCODING_PCM_16BIT, 2048, p -> {
+        compare("44.1k AGC + Сцена 3 + Air 5", 44100, 2, C.ENCODING_PCM_16BIT, 2048, p -> {
+            p.setAirStep(5);
             p.setSoundCheckEnabled(true);
-            p.setSoftwareEqEnabled(true);
-            p.setBandLevel(0, 8f);
-            p.setBandLevel(9, -6f);
             p.setCrossfeedStep(3);
         });
         System.out.println(failures == 0 ? "ВСЕ СОВПАЛИ" : ("РАСХОЖДЕНИЙ: " + failures));

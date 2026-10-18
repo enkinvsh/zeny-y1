@@ -296,8 +296,7 @@
 
             <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="top">
                 <LinearLayout android:id="@+id/layout_player_cover_column" android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="vertical" android:layout_marginRight="14dp" android:layout_marginTop="10dp">
-                    <FrameLayout android:id="@+id/frame_album_art" android:layout_width="220dp" android:layout_height="220dp"
-                        android:rotationY="18">
+                    <FrameLayout android:id="@+id/frame_album_art" android:layout_width="220dp" android:layout_height="220dp">
                         <com.themoon.y1.views.SquareImageView android:id="@+id/iv_album_art" android:layout_width="match_parent" android:layout_height="match_parent" android:scaleType="centerCrop" android:src="@drawable/default_album" android:background="#DDDDDD" />
                         <!-- Затемнение обложки на паузе (плоская тема): отдельный слой, а не setAlpha всей картинки. -->
                         <View android:id="@+id/view_cover_dim" android:layout_width="match_parent" android:layout_height="match_parent" android:visibility="gone" />
@@ -306,8 +305,7 @@
                         <ImageView android:id="@+id/iv_cover_like" android:layout_width="34dp" android:layout_height="34dp" android:layout_gravity="bottom|left" android:layout_marginLeft="17dp" android:layout_marginBottom="17dp" android:visibility="gone" />
                     </FrameLayout>
                     <!-- 🚀 [신규 추가] 아래로 살짝 비치는 반사 효과 (iPod 스타일) -->
-                    <FrameLayout android:id="@+id/frame_album_reflection" android:layout_width="220dp" android:layout_height="32dp" android:layout_marginTop="1dp"
-                        android:rotationY="18">
+                    <FrameLayout android:id="@+id/frame_album_reflection" android:layout_width="220dp" android:layout_height="32dp" android:layout_marginTop="1dp">
                         <ImageView android:id="@+id/iv_album_reflection" android:layout_width="220dp" android:layout_height="220dp" android:layout_gravity="top" android:scaleY="-1" android:scaleType="centerCrop" android:alpha="0.30" android:src="@drawable/default_album" />
                         <View android:layout_width="match_parent" android:layout_height="match_parent" android:background="@drawable/reflection_fade_gradient" />
                     </FrameLayout>

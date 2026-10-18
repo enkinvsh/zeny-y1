@@ -14,21 +14,16 @@ import java.nio.ByteOrder;
  * 2) Аудиовыход Y1 (AudioFlinger primary и A2DP) работает только на 44.1 кГц; собственный
  *    4-точечный кубический ресемплер Эрмита переводит 48 -> 44.1 кГц в 32-bit float,
  *    избавляя тракт от примитивного линейного ресемплера Android 4.2.
- * 3) Профиль Zeny Natural компенсирует психоакустические потери сжатого Opus (~130 кбит/с):
- *    возвращает чётную гармонику суббаса (< 95 Гц), убирает цифровую колкость на 3.85/6.2 кГц,
- *    добавляет воздух выше 13.5 кГц и строит бинауральную сцену Бауэра с межуншной задержкой 250 мкс.
- * 4) На выходе мягкий Padé-tanh лимитер защищает пики, а TPDF-дизеринг убирает ступеньки квантования 16 бит.
+ * 3) По умолчанию тракт прозрачен (замер: АЧХ в пределах ±0.003 дБ). Единственная окраска тембра, опция
+ *    «Воздух» (шаги 0..4), это один очень широкий плавный полюс-нулевой фильтр первого порядка (6 дБ/окт)
+ *    без резонанса и без изменения баса; нелинейных добавок и скрытого кроссфида нет. Опция «Сцена»
+ *    (шаги 0..3) подмешивает в каждое ухо низкочастотную часть соседнего канала; центр и моно при этом
+ *    остаются на единичном уровне на всех частотах.
+ * 4) На выходе мягкий рациональный лимитер защищает пики, а TPDF-дизеринг убирает ступеньки квантования 16 бит.
  */
 public class ZenyAudioProcessor implements AudioProcessor {
 
     public static final int TARGET_SAMPLE_RATE = 44100;
-
-    private static final float[] EQ_FREQS = {
-        31f, 62f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f
-    };
-
-    // Межуншная задержка по модели Бауэра (~250 мкс = 12 отсчётов на 48 кГц, 11 на 44.1 кГц)
-    private static final int DELAY_RING_MASK = 15;
 
     private AudioFormat pendingInputFormat = AudioFormat.NOT_SET;
     private AudioFormat pendingOutputFormat = AudioFormat.NOT_SET;
@@ -39,8 +34,7 @@ public class ZenyAudioProcessor implements AudioProcessor {
     private ByteBuffer outputBuffer = EMPTY_BUFFER;
     private boolean inputEnded = false;
 
-    private volatile boolean zenyNaturalEnabled = true;
-    private volatile boolean softwareEqEnabled = false;
+    private volatile int airStep = 0;
     private volatile boolean soundCheckEnabled = false;
     private volatile int crossfeedStep = 0;
 
@@ -56,28 +50,22 @@ public class ZenyAudioProcessor implements AudioProcessor {
     private float agcReleaseCoeff = 3.5e-6f;
     private float agcGainCoeff = 1.4e-5f;
 
-    // 10-полосный графический эквалайзер (по 2 канала)
-    private final float[] eqGainsDb = new float[10];
-    private final boolean[] eqBandActive = new boolean[10];
-    private final Biquad[][] eqFilters = new Biquad[2][10];
-    private volatile boolean anyEqBandActive = false;
+    // Полка «Воздух»: один фильтр первого порядка на канал (в биквад-структуре с b2 = a2 = 0)
+    private final Biquad[] airFilters = new Biquad[2];
+    // Плато полки по шагам 0..5, дБ. Шаг 0 пропускает ступень целиком (побитово как без неё).
+    // Ряд 6..18 дБ подобран владельцем по слуху, он же определяет верхнюю границу (+18 дБ).
+    private static final float[] AIR_GAIN_DB = {0f, 6f, 9f, 12f, 15f, 18f};
+    // Геометрический центр полки. У полки первого порядка прирост на нём ровно половина плато в дБ,
+    // а 8 кГц оставляет 2-5 кГц почти нетронутыми (нет «носового» горба пикового эквалайзера).
+    private static final float AIR_MID_HZ = 8000f;
 
-    // Фильтры Zeny Natural: 0 = фундамент 62 Гц, 1 = de-harsh 3.85 кГц, 2 = сибилянты 6.2 кГц, 3 = воздух 13.5 кГц
-    private final Biquad[][] naturalFilters = new Biquad[2][4];
-
-    // Однополюсный фильтр выделения суббаса (< 95 Гц) и DC-блокер (18 Гц) для чётного гармонического насыщения
-    private float subLpCoeff = 0.012f;
-    private float dcHpCoeff = 0.9975f;
-    private float subStateL = 0.0f, subStateR = 0.0f;
-    private float dcInL = 0.0f, dcOutL = 0.0f, dcInR = 0.0f, dcOutR = 0.0f;
-
-    // Бинауральный Crossfeed Бауэра с линией задержки и ВЧ-компенсацией прямого сигнала
-    private float cfLpCoeff = 0.085f;
-    private float cfLpL = 0.0f, cfLpR = 0.0f;
-    private final float[] delayL = new float[16];
-    private final float[] delayR = new float[16];
-    private int delayWriteIdx = 0;
-    private int delaySamples = 12;
+    // «Сцена»: ФНЧ с единичным усилением на постоянной составляющей (700 Гц), общий для вычитания из
+    // прямого пути и для подмешивания в соседний канал. Отдельной линии задержки нет: групповая задержка
+    // самого однополюсного фильтра (около 217 мкс на НЧ) и есть межуншная задержка.
+    private float stageLpCoeff = 0.085f;
+    private float stageLpL = 0.0f, stageLpR = 0.0f;
+    // Подача соседнего канала по шагам 1..3, дБ (700 Гц / 3, 4.5, 6 дБ: открытые пресеты libbs2b)
+    private static final float[] STAGE_FEED_DB = {0f, 3.0f, 4.5f, 6.0f};
 
     // Ресемплер на выходную частоту 44.1 кГц. Основной путь: полифазный оконный sinc с точными строками
     // для рационального отношения частот (48000 -> 44100 даёт ровно 147 фаз). Кубический Эрмит нужен
@@ -115,22 +103,16 @@ public class ZenyAudioProcessor implements AudioProcessor {
 
     public ZenyAudioProcessor() {
         for (int ch = 0; ch < 2; ch++) {
-            for (int b = 0; b < 10; b++) {
-                eqFilters[ch][b] = new Biquad();
-            }
-            for (int i = 0; i < 4; i++) {
-                naturalFilters[ch][i] = new Biquad();
-            }
+            airFilters[ch] = new Biquad();
         }
     }
 
-    public void setZenyNaturalEnabled(boolean enabled) {
-        this.zenyNaturalEnabled = enabled;
+    /** Шаг «Воздуха» 0..5 (выкл, +6, +9, +12, +15, +18 дБ); 0 = ступень выключена. */
+    public void setAirStep(int step) {
+        this.airStep = Math.max(0, Math.min(AIR_GAIN_DB.length - 1, step));
+        int fs = inputFormat.sampleRate > 0 ? inputFormat.sampleRate : 48000;
+        configureAir(fs);
         recomputeStaticGain();
-    }
-
-    public boolean isZenyNaturalEnabled() {
-        return zenyNaturalEnabled;
     }
 
     /** Разрешает нативное ядро; решение применяется при следующем flush(). Нужен тестам для сравнения с Java. */
@@ -142,16 +124,12 @@ public class ZenyAudioProcessor implements AudioProcessor {
         return nativeActive;
     }
 
-    public void setSoftwareEqEnabled(boolean enabled) {
-        this.softwareEqEnabled = enabled;
-        recomputeStaticGain();
-    }
-
     public void setSoundCheckEnabled(boolean enabled) {
         this.soundCheckEnabled = enabled;
         recomputeStaticGain();
     }
 
+    /** Шаг «Сцены» 0..3; имя метода и ключ настройки crossfeed_step сохранены ради совместимости. */
     public void setCrossfeedStep(int step) {
         this.crossfeedStep = Math.max(0, Math.min(3, step));
     }
@@ -167,36 +145,9 @@ public class ZenyAudioProcessor implements AudioProcessor {
         recomputeStaticGain();
     }
 
-    public void setBandLevel(int bandIndex, float dbGain) {
-        if (bandIndex < 0 || bandIndex >= 10) return;
-        eqGainsDb[bandIndex] = dbGain;
-        eqBandActive[bandIndex] = Math.abs(dbGain) >= 0.05f;
-        boolean any = false;
-        for (int i = 0; i < 10; i++) {
-            if (eqBandActive[i]) {
-                any = true;
-                break;
-            }
-        }
-        anyEqBandActive = any;
-        int fs = inputFormat.sampleRate > 0 ? inputFormat.sampleRate : 48000;
-        configureEqBand(bandIndex, fs);
-        recomputeStaticGain();
-    }
-
     private void recomputeStaticGain() {
-        // Запас 1.2 дБ под интерсемпловые пики сжатого аудио. Профиль Zeny Natural сознательно не меняет
-        // уровень середины (1-2 кГц): включая его, слушатель сравнивает тембр, а не «кто громче».
+        // Запас 1.2 дБ под интерсемпловые пики сжатого аудио
         float db = -1.2f;
-        if (softwareEqEnabled && anyEqBandActive) {
-            float maxBoost = 0.0f;
-            for (int i = 0; i < 10; i++) {
-                if (eqGainsDb[i] > maxBoost) maxBoost = eqGainsDb[i];
-            }
-            if (maxBoost > 1.5f) {
-                db -= Math.min(6.0f, (maxBoost - 1.5f) * 0.55f);
-            }
-        }
         if (soundCheckEnabled && !Float.isNaN(taggedGainDb)) {
             float clampedTag = Math.max(-9.5f, Math.min(4.0f, taggedGainDb));
             db += clampedTag;
@@ -206,46 +157,33 @@ public class ZenyAudioProcessor implements AudioProcessor {
 
     private void configureFilters(int fs) {
         if (fs <= 0) return;
-        for (int b = 0; b < 10; b++) {
-            configureEqBand(b, fs);
-        }
-        // Профиль Zeny Natural:
-        // 0) Тёплый фундамент низа 62 Гц (+1.5 дБ, Q=0.72) без раздувания мидбаса 140-200 Гц
-        // 1) Снятие цифровой рези кодека в зоне максимальной чувствительности уха 3850 Гц (-1.5 дБ, Q=1.65)
-        // 2) Мягкое приглаживание жёстких сибилянтов 6200 Гц (-0.8 дБ, Q=2.0)
-        // 3) Возврат «воздуха» и затуханий тарелок выше 13.5 кГц (+1.7 дБ, Q=0.707)
-        float airFreq = Math.min(13500f, fs * 0.44f);
-        for (int ch = 0; ch < 2; ch++) {
-            naturalFilters[ch][0].setPeakingEQ(fs, 62f, 0.72f, 1.5f);
-            naturalFilters[ch][1].setPeakingEQ(fs, 3850f, 1.65f, -1.5f);
-            naturalFilters[ch][2].setPeakingEQ(fs, 6200f, 2.0f, -0.8f);
-            naturalFilters[ch][3].setHighShelf(fs, airFreq, 0.707f, 1.7f);
-        }
+        configureAir(fs);
 
-        // Коэффициенты однополюсных фильтров суббаса (95 Гц), DC-блокера (18 Гц) и кроссфида Бауэра (700 Гц)
-        subLpCoeff = onePoleLpCoeff(fs, 95.0f);
-        dcHpCoeff = (float) Math.exp(-2.0 * Math.PI * 18.0 / fs);
-        cfLpCoeff = onePoleLpCoeff(fs, 700.0f);
-        delaySamples = Math.max(1, Math.min(15, Math.round(fs * 0.00025f))); // 250 мкс
+        stageLpCoeff = onePoleLpCoeff(fs, 700.0f);
         agcAttackCoeff = (float) (1.0 - Math.exp(-1.0 / (3.0 * fs)));
         agcReleaseCoeff = (float) (1.0 - Math.exp(-1.0 / (6.0 * fs)));
         agcGainCoeff = (float) (1.0 - Math.exp(-1.0 / (1.5 * fs)));
     }
 
+    /**
+     * Аналоговый прототип H(s) = (1 + s/wz)/(1 + s/wp), усиление на постоянной составляющей 1, плато K = wp/wz,
+     * центр sqrt(wz*wp) = 8 кГц. Билинейное преобразование здесь не годится: при плато +12 дБ оно уводит
+     * частоты полюса и нуля (4 и 16 кГц) так, что на 12-20 кГц ошибка 3-7 дБ (на +18 дБ ещё больше). Поэтому ноль берётся по
+     * согласованному z-преобразованию (exp(-wz*T)), а полюс подбирается делением отрезка пополам так, чтобы
+     * цифровое усиление совпало с аналоговым на 0.8 от Найквиста. Остаточное отклонение от прототипа
+     * на 1-20 кГц не больше 0.2 дБ для 44.1 и 48 кГц.
+     */
+    private void configureAir(int fs) {
+        if (fs <= 0) return;
+        float gainDb = AIR_GAIN_DB[airStep];
+        for (int ch = 0; ch < 2; ch++) {
+            airFilters[ch].setFirstOrderShelf(fs, AIR_MID_HZ, gainDb);
+        }
+    }
+
     private static float onePoleLpCoeff(int fs, float fc) {
         double x = Math.exp(-2.0 * Math.PI * fc / fs);
         return (float) (1.0 - x);
-    }
-
-    private void configureEqBand(int bandIndex, int fs) {
-        float f0 = EQ_FREQS[bandIndex];
-        if (f0 >= fs * 0.47f) {
-            f0 = fs * 0.47f;
-        }
-        float gain = eqGainsDb[bandIndex];
-        for (int ch = 0; ch < 2; ch++) {
-            eqFilters[ch][bandIndex].setPeakingEQ(fs, f0, 1.414f, gain);
-        }
     }
 
     @Override
@@ -298,30 +236,24 @@ public class ZenyAudioProcessor implements AudioProcessor {
             buffer.clear();
         }
 
-        final boolean doNatural = zenyNaturalEnabled;
-        final boolean doEq = softwareEqEnabled && anyEqBandActive;
+        final boolean doAir = airStep > 0;
         final boolean doAgc = soundCheckEnabled && Float.isNaN(taggedGainDb);
         final float baseGain = targetStaticGainLinear;
 
-        // Интенсивность бинаурального кроссфида: явная настройка пользователя либо деликатные 8.5% внутри Zeny Natural
-        float cfMix = 0.0f;
-        if (crossfeedStep == 1) cfMix = 0.15f;
-        else if (crossfeedStep == 2) cfMix = 0.24f;
-        else if (crossfeedStep >= 3) cfMix = 0.33f;
-        else if (doNatural) cfMix = 0.085f;
-        final boolean doCrossfeed = (channels == 2 && cfMix > 0.0f);
-        // Суммарной нормировки нет: середина остаётся на единичном уровне, а бас центра с кроссфидом
-        // поднимается не больше чем на 0.7 дБ при 8.5%
-        final float cfNorm = 1.0f;
+        // Доля подмешиваемого НЧ: G = 1/(1 + 10^(feed/20)). На НЧ прямой путь 1-G, перекрёстный G, их сумма
+        // ровно 1, поэтому центр и моно не меняют уровень; выше 700 Гц прямой путь равен 1, перекрёстного нет.
+        // Шаг 0 пропускает ступень целиком, без нормировки и без пересчёта уровня.
+        final int stageIdx = Math.max(0, Math.min(3, crossfeedStep));
+        final float stageG = stageIdx == 0 ? 0.0f
+                : (float) (1.0 / (1.0 + Math.pow(10.0, STAGE_FEED_DB[stageIdx] / 20.0)));
+        final boolean doStage = (channels == 2 && stageIdx > 0);
 
-        final float subCoeff = subLpCoeff;
-        final float dcCoeff = dcHpCoeff;
-        final float cfCoeff = cfLpCoeff;
+        final float stageCoeff = stageLpCoeff;
         int rng = ditherRng;
 
         if (nativeActive) {
-            queueNative(inputBuffer, inFrames, bytesPerFrame, maxOutFrames, baseGain, cfMix, doNatural, doEq,
-                    doAgc, doCrossfeed);
+            queueNative(inputBuffer, inFrames, bytesPerFrame, maxOutFrames, baseGain, stageG, doAir,
+                    doAgc, doStage);
             return;
         }
 
@@ -353,69 +285,24 @@ public class ZenyAudioProcessor implements AudioProcessor {
             L *= g;
             R *= g;
 
-            // 2. 10-полосный эквалайзер (считаются только ненулевые полосы)
-            if (doEq) {
-                for (int b = 0; b < 10; b++) {
-                    if (eqBandActive[b]) {
-                        L = eqFilters[0][b].process(L);
-                        if (channels == 2) R = eqFilters[1][b].process(R);
-                    }
-                }
+            // 2. «Воздух»: одна полка первого порядка (шаг 0 = ступень пропускается)
+            if (doAir) {
+                L = airFilters[0].process(L);
+                if (channels == 2) R = airFilters[1].process(R);
             }
 
-            // 3. Zeny Natural: гармоническое насыщение суббаса (< 95 Гц) + 4 психоакустических фильтра
-            if (doNatural) {
-                subStateL += subCoeff * (L - subStateL);
-                float sL = subStateL;
-                // Мягкая квадратичная + кубическая гармоника даёт плотность баса без гула на середине
-                float harmL = sL * (0.14f * Math.abs(sL) + 0.06f * sL);
-                float dcL = harmL - dcInL + dcCoeff * dcOutL;
-                dcInL = harmL;
-                dcOutL = dcL;
-                L += dcL;
-
-                L = naturalFilters[0][0].process(L);
-                L = naturalFilters[0][1].process(L);
-                L = naturalFilters[0][2].process(L);
-                L = naturalFilters[0][3].process(L);
-
-                if (channels == 2) {
-                    subStateR += subCoeff * (R - subStateR);
-                    float sR = subStateR;
-                    float harmR = sR * (0.14f * Math.abs(sR) + 0.06f * sR);
-                    float dcR = harmR - dcInR + dcCoeff * dcOutR;
-                    dcInR = harmR;
-                    dcOutR = dcR;
-                    R += dcR;
-
-                    R = naturalFilters[1][0].process(R);
-                    R = naturalFilters[1][1].process(R);
-                    R = naturalFilters[1][2].process(R);
-                    R = naturalFilters[1][3].process(R);
-                }
-            }
-
-            // 4. Бинауральный Crossfeed Бауэра с межуншной задержкой 250 мкс
-            if (doCrossfeed) {
-                cfLpL += cfCoeff * (L - cfLpL);
-                cfLpR += cfCoeff * (R - cfLpR);
-                delayL[delayWriteIdx] = cfLpL;
-                delayR[delayWriteIdx] = cfLpR;
-                int readIdx = (delayWriteIdx - delaySamples) & DELAY_RING_MASK;
-                delayWriteIdx = (delayWriteIdx + 1) & DELAY_RING_MASK;
-
-                float delayedLowL = delayL[readIdx];
-                float delayedLowR = delayR[readIdx];
-                // Высокочастотная составляющая прямого канала чуть приподнимается, сохраняя ровный тональный баланс
-                float highL = L - cfLpL;
-                float highR = R - cfLpR;
-                float outL = (L + 0.06f * highL + cfMix * delayedLowR) * cfNorm;
-                float outR = (R + 0.06f * highR + cfMix * delayedLowL) * cfNorm;
+            // 3. «Сцена»: out = in + G*(LP(соседний) - LP(свой)). Запись через разность даёт L=R ровно на выходе
+            // (без остаточной ошибки округления в моно) и тот же порядок операций, что в нативном ядре
+            if (doStage) {
+                stageLpL += stageCoeff * (L - stageLpL);
+                stageLpR += stageCoeff * (R - stageLpR);
+                float outL = L + stageG * (stageLpR - stageLpL);
+                float outR = R + stageG * (stageLpL - stageLpR);
                 L = outL;
                 R = outR;
             }
 
-            // 5. Вывод: полифазный sinc-ресемплер (48 -> 44.1 кГц), запасной Эрмит или напрямую (44.1 кГц)
+            // 4. Вывод: полифазный sinc-ресемплер (48 -> 44.1 кГц), запасной Эрмит или напрямую (44.1 кГц)
             if (resampleActive && polyTaps != null) {
                 final int mask = ringMask;
                 long newest = polyNewest + 1;
@@ -482,8 +369,8 @@ public class ZenyAudioProcessor implements AudioProcessor {
      * (одни и те же формулы для обоих путей), в C уходит готовый набор.
      */
     private void queueNative(ByteBuffer inputBuffer, int inFrames, int bytesPerFrame, int maxOutFrames,
-                             float baseGain, float cfMix, boolean doNatural, boolean doEq, boolean doAgc,
-                             boolean doCrossfeed) {
+                             float baseGain, float stageG, boolean doAir, boolean doAgc,
+                             boolean doStage) {
         final int channels = inputFormat.channelCount;
         ByteBuffer src = inputBuffer;
         int srcOffset = inputBuffer.position();
@@ -504,36 +391,26 @@ public class ZenyAudioProcessor implements AudioProcessor {
         final float[] fp = nativeFp;
         final int[] ip = nativeIp;
         fp[ZenyNative.FP_BASE_GAIN] = baseGain;
-        fp[ZenyNative.FP_CF_MIX] = cfMix;
+        fp[ZenyNative.FP_STAGE_G] = stageG;
         fp[ZenyNative.FP_AGC_ATTACK] = agcAttackCoeff;
         fp[ZenyNative.FP_AGC_RELEASE] = agcReleaseCoeff;
         fp[ZenyNative.FP_AGC_GAIN_COEFF] = agcGainCoeff;
-        fp[ZenyNative.FP_SUB_COEFF] = subLpCoeff;
-        fp[ZenyNative.FP_DC_COEFF] = dcHpCoeff;
-        fp[ZenyNative.FP_CF_COEFF] = cfLpCoeff;
+        fp[ZenyNative.FP_STAGE_COEFF] = stageLpCoeff;
         fp[ZenyNative.FP_RUNNING_POWER] = runningPower;
         fp[ZenyNative.FP_AGC_GAIN] = agcGainLinear;
-        for (int b = 0; b < 10; b++) {
-            eqFilters[0][b].copyCoefficients(fp, ZenyNative.FP_EQ_COEF + b * 5);
-            ip[ZenyNative.IP_EQ_ACTIVE + b] = eqBandActive[b] ? 1 : 0;
-        }
-        for (int i = 0; i < 4; i++) {
-            naturalFilters[0][i].copyCoefficients(fp, ZenyNative.FP_NAT_COEF + i * 5);
-        }
+        airFilters[0].copyCoefficients(fp, ZenyNative.FP_AIR_COEF);
 
         ip[ZenyNative.IP_CHANNELS] = channels;
         ip[ZenyNative.IP_ENCODING] = inputFormat.encoding;
-        ip[ZenyNative.IP_DO_NATURAL] = doNatural ? 1 : 0;
-        ip[ZenyNative.IP_DO_EQ] = doEq ? 1 : 0;
+        ip[ZenyNative.IP_DO_AIR] = doAir ? 1 : 0;
         ip[ZenyNative.IP_DO_AGC] = doAgc ? 1 : 0;
-        ip[ZenyNative.IP_DO_CROSSFEED] = doCrossfeed ? 1 : 0;
+        ip[ZenyNative.IP_DO_STAGE] = doStage ? 1 : 0;
         ip[ZenyNative.IP_RES_MODE] = !resampleActive ? 0 : (polyTaps != null ? 1 : 2);
         ip[ZenyNative.IP_POLY_NUM] = polyNum;
         ip[ZenyNative.IP_POLY_DEN] = polyDen;
         ip[ZenyNative.IP_POLY_HALF] = polyHalf;
         ip[ZenyNative.IP_POLY_TAPS] = polyTapCount;
         ip[ZenyNative.IP_RING_MASK] = ringMask;
-        ip[ZenyNative.IP_DELAY] = delaySamples;
         ip[ZenyNative.IP_RNG] = ditherRng;
         ip[ZenyNative.IP_FRAMES] = inFrames;
         ip[ZenyNative.IP_IN_RATE] = inputFormat.sampleRate;
@@ -683,18 +560,10 @@ public class ZenyAudioProcessor implements AudioProcessor {
             ZenyNative.reset(nativeState);
         }
 
-        subStateL = subStateR = 0.0f;
-        dcInL = dcOutL = dcInR = dcOutR = 0.0f;
-        cfLpL = cfLpR = 0.0f;
-        for (int i = 0; i < 16; i++) {
-            delayL[i] = 0.0f;
-            delayR[i] = 0.0f;
-        }
-        delayWriteIdx = 0;
+        stageLpL = stageLpR = 0.0f;
 
         for (int ch = 0; ch < 2; ch++) {
-            for (int b = 0; b < 10; b++) eqFilters[ch][b].reset();
-            for (int i = 0; i < 4; i++) naturalFilters[ch][i].reset();
+            airFilters[ch].reset();
         }
         if (inRate > 0) {
             configureFilters(inRate);
@@ -799,54 +668,42 @@ public class ZenyAudioProcessor implements AudioProcessor {
         private float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
         private float z1 = 0.0f, z2 = 0.0f;
 
-        void setPeakingEQ(float fs, float f0, float q, float dbGain) {
-            if (Math.abs(dbGain) < 0.01f) {
+        /**
+         * Полка первого порядка (ноль и полюс вещественные), записанная как биквад с b2 = a2 = 0.
+         * Параметры и способ подбора полюса описаны у ZenyAudioProcessor.configureAir.
+         */
+        void setFirstOrderShelf(float fs, float midHz, float gainDb) {
+            if (gainDb < 0.01f) {
                 b0 = 1.0f; b1 = 0.0f; b2 = 0.0f; a1 = 0.0f; a2 = 0.0f;
                 return;
             }
-            double A = Math.pow(10.0, dbGain / 40.0);
-            double w0 = 2.0 * Math.PI * f0 / fs;
-            double cosW = Math.cos(w0);
-            double alpha = Math.sin(w0) / (2.0 * q);
-
-            double bb0 = 1.0 + alpha * A;
-            double bb1 = -2.0 * cosW;
-            double bb2 = 1.0 - alpha * A;
-            double aa0 = 1.0 + alpha / A;
-            double aa1 = -2.0 * cosW;
-            double aa2 = 1.0 - alpha / A;
-
-            b0 = (float) (bb0 / aa0);
-            b1 = (float) (bb1 / aa0);
-            b2 = (float) (bb2 / aa0);
-            a1 = (float) (aa1 / aa0);
-            a2 = (float) (aa2 / aa0);
-        }
-
-        void setHighShelf(float fs, float f0, float q, float dbGain) {
-            if (Math.abs(dbGain) < 0.01f) {
-                b0 = 1.0f; b1 = 0.0f; b2 = 0.0f; a1 = 0.0f; a2 = 0.0f;
-                return;
+            double k = Math.pow(10.0, gainDb / 20.0);
+            double fz = midHz / Math.sqrt(k);
+            double fp = midHz * Math.sqrt(k);
+            double zd = Math.exp(-2.0 * Math.PI * fz / fs);
+            double fn = 0.8 * 0.5 * fs;
+            double w = 2.0 * Math.PI * fn / fs;
+            // Целевое аналоговое усиление на fn
+            double target = Math.sqrt((1.0 + (fn / fz) * (fn / fz)) / (1.0 + (fn / fp) * (fn / fp)));
+            // |H|^2 цифрового фильтра на fn при ДК-усилении 1; монотонно убывает с ростом полюса
+            double numMag2 = 1.0 - 2.0 * zd * Math.cos(w) + zd * zd;
+            // Нижняя граница отрицательная: при плато 18 дБ на 44.1 кГц полюс прототипа (22.5 кГц) выше Найквиста,
+            // и даже с полюсом в нуле усиление на fn недобирает 0.3 дБ. Полюс слева от нуля (до -0.9) добирает
+            // его и остаётся устойчивым; монотонность g2 по полюсу на (-1, 1) сохраняется.
+            double lo = -0.9, hi = 0.99;
+            for (int i = 0; i < 60; i++) {
+                double pd = 0.5 * (lo + hi);
+                double g2 = (1.0 - pd) * (1.0 - pd) / ((1.0 - zd) * (1.0 - zd))
+                        * numMag2 / (1.0 - 2.0 * pd * Math.cos(w) + pd * pd);
+                if (g2 > target * target) lo = pd; else hi = pd;
             }
-            double A = Math.pow(10.0, dbGain / 40.0);
-            double w0 = 2.0 * Math.PI * f0 / fs;
-            double cosW = Math.cos(w0);
-            double sinW = Math.sin(w0);
-            double alpha = sinW / (2.0 * q);
-            double twoSqrtAAlpha = 2.0 * Math.sqrt(A) * alpha;
-
-            double bb0 = A * ((A + 1.0) + (A - 1.0) * cosW + twoSqrtAAlpha);
-            double bb1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cosW);
-            double bb2 = A * ((A + 1.0) + (A - 1.0) * cosW - twoSqrtAAlpha);
-            double aa0 = (A + 1.0) - (A - 1.0) * cosW + twoSqrtAAlpha;
-            double aa1 = 2.0 * ((A - 1.0) - (A + 1.0) * cosW);
-            double aa2 = (A + 1.0) - (A - 1.0) * cosW - twoSqrtAAlpha;
-
-            b0 = (float) (bb0 / aa0);
-            b1 = (float) (bb1 / aa0);
-            b2 = (float) (bb2 / aa0);
-            a1 = (float) (aa1 / aa0);
-            a2 = (float) (aa2 / aa0);
+            double pd = 0.5 * (lo + hi);
+            double g0 = (1.0 - pd) / (1.0 - zd);
+            b0 = (float) g0;
+            b1 = (float) (-zd * g0);
+            b2 = 0.0f;
+            a1 = (float) -pd;
+            a2 = 0.0f;
         }
 
         float process(float x) {

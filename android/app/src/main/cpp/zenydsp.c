@@ -17,39 +17,33 @@
 #include <stdint.h>
 
 #define FP_BASE_GAIN 0
-#define FP_CF_MIX 1
+#define FP_STAGE_G 1
 #define FP_AGC_ATTACK 2
 #define FP_AGC_RELEASE 3
 #define FP_AGC_GAIN_COEFF 4
-#define FP_SUB_COEFF 5
-#define FP_DC_COEFF 6
-#define FP_CF_COEFF 7
-#define FP_RUNNING_POWER 8
-#define FP_AGC_GAIN 9
-#define FP_EQ_COEF 10   /* 10 полос x 5: b0 b1 b2 a1 a2 */
-#define FP_NAT_COEF 60  /* 4 фильтра x 5 */
-#define FP_LEN 80
+#define FP_STAGE_COEFF 5
+#define FP_RUNNING_POWER 6 /* FP_RUNNING_POWER и FP_AGC_GAIN идут подряд: возвращаются в Java одной записью */
+#define FP_AGC_GAIN 7
+#define FP_AIR_COEF 8   /* один фильтр первого порядка в биквад-форме: b0 b1 b2 a1 a2 */
+#define FP_LEN 13
 
 #define IP_CHANNELS 0
 #define IP_ENCODING 1
-#define IP_DO_NATURAL 2
-#define IP_DO_EQ 3
-#define IP_DO_AGC 4
-#define IP_DO_CROSSFEED 5
-#define IP_RES_MODE 6   /* 0 напрямую, 1 полифазный sinc, 2 кубический Эрмит */
-#define IP_POLY_NUM 7
-#define IP_POLY_DEN 8
-#define IP_POLY_HALF 9
-#define IP_POLY_TAPS 10
-#define IP_RING_MASK 11
-#define IP_DELAY 12
-#define IP_RNG 13
-#define IP_FRAMES 14
-#define IP_IN_RATE 15
-#define IP_OUT_RATE 16
-#define IP_EQ_ACTIVE 17 /* 10 флагов */
-#define IP_MAX_OUT 27   /* ёмкость выходного буфера в кадрах: запись за её пределы в нативном коде не отловит никто */
-#define IP_LEN 28
+#define IP_DO_AIR 2
+#define IP_DO_AGC 3
+#define IP_DO_STAGE 4
+#define IP_RES_MODE 5   /* 0 напрямую, 1 полифазный sinc, 2 кубический Эрмит */
+#define IP_POLY_NUM 6
+#define IP_POLY_DEN 7
+#define IP_POLY_HALF 8
+#define IP_POLY_TAPS 9
+#define IP_RING_MASK 10
+#define IP_RNG 11
+#define IP_FRAMES 12
+#define IP_IN_RATE 13
+#define IP_OUT_RATE 14
+#define IP_MAX_OUT 15   /* ёмкость выходного буфера в кадрах: запись за её пределы в нативном коде не отловит никто */
+#define IP_LEN 16
 
 /* Значения совпадают с C.ENCODING_PCM_* из ExoPlayer 2.13 */
 #define ENC_16 2
@@ -65,11 +59,8 @@ typedef struct {
 } Bq;
 
 typedef struct {
-    Bq eq[2][10];
-    Bq nat[2][4];
-    float subL, subR, dcInL, dcOutL, dcInR, dcOutR, cfLpL, cfLpR;
-    float delayL[16], delayR[16];
-    int32_t delayWrite;
+    Bq air[2];
+    float stageLpL, stageLpR;
     float hist[2][4];
     double resPhase;
     int32_t polyPhase;
@@ -192,10 +183,9 @@ JNIEXPORT jint JNICALL Java_com_themoon_y1_managers_ZenyNative_process(JNIEnv *e
     const int enc = ip[IP_ENCODING];
     const int bps = bytes_per_sample(enc);
     const int frames = ip[IP_FRAMES];
-    const int doNatural = ip[IP_DO_NATURAL];
-    const int doEq = ip[IP_DO_EQ];
+    const int doAir = ip[IP_DO_AIR];
     const int doAgc = ip[IP_DO_AGC];
-    const int doCf = ip[IP_DO_CROSSFEED];
+    const int doStage = ip[IP_DO_STAGE];
     const int resMode = ip[IP_RES_MODE];
     const int polyNum = ip[IP_POLY_NUM];
     const int polyDen = ip[IP_POLY_DEN];
@@ -203,24 +193,20 @@ JNIEXPORT jint JNICALL Java_com_themoon_y1_managers_ZenyNative_process(JNIEnv *e
     const int tapCount = ip[IP_POLY_TAPS];
     const int mask = ip[IP_RING_MASK];
     const int ringSize = mask + 1;
-    const int delaySamples = ip[IP_DELAY];
     const double hermiteStep = (ip[IP_OUT_RATE] > 0) ? (double)ip[IP_IN_RATE] / (double)ip[IP_OUT_RATE] : 1.0;
     const int maxOut = ip[IP_MAX_OUT];
     uint32_t rng = (uint32_t)ip[IP_RNG];
 
     const float baseGain = fp[FP_BASE_GAIN];
-    const float cfMix = fp[FP_CF_MIX];
+    const float stageG = fp[FP_STAGE_G];
     const float agcAttack = fp[FP_AGC_ATTACK];
     const float agcRelease = fp[FP_AGC_RELEASE];
     const float agcGainCoeff = fp[FP_AGC_GAIN_COEFF];
-    const float subCoeff = fp[FP_SUB_COEFF];
-    const float dcCoeff = fp[FP_DC_COEFF];
-    const float cfCoeff = fp[FP_CF_COEFF];
+    const float stageCoeff = fp[FP_STAGE_COEFF];
     float runningPower = fp[FP_RUNNING_POWER];
     float agcGain = fp[FP_AGC_GAIN];
 
     int outFrames = 0;
-    int delayWrite = st->delayWrite;
 
     for (int f = 0; f < frames; f++) {
         const uint8_t *fr = in + (size_t)f * (size_t)channels * (size_t)bps;
@@ -243,53 +229,17 @@ JNIEXPORT jint JNICALL Java_com_themoon_y1_managers_ZenyNative_process(JNIEnv *e
         L *= g;
         R *= g;
 
-        if (doEq) {
-            for (int b = 0; b < 10; b++) {
-                if (ip[IP_EQ_ACTIVE + b]) {
-                    const float *c = &fp[FP_EQ_COEF + b * 5];
-                    L = bq(c, &st->eq[0][b], L);
-                    if (channels == 2) R = bq(c, &st->eq[1][b], R);
-                }
-            }
+        if (doAir) {
+            L = bq(&fp[FP_AIR_COEF], &st->air[0], L);
+            if (channels == 2) R = bq(&fp[FP_AIR_COEF], &st->air[1], R);
         }
 
-        if (doNatural) {
-            st->subL += subCoeff * (L - st->subL);
-            float sL = st->subL;
-            float aL = sL < 0.0f ? -sL : sL;
-            float harmL = sL * (0.14f * aL + 0.06f * sL);
-            float dcL = harmL - st->dcInL + dcCoeff * st->dcOutL;
-            st->dcInL = harmL;
-            st->dcOutL = dcL;
-            L += dcL;
-            for (int i = 0; i < 4; i++) L = bq(&fp[FP_NAT_COEF + i * 5], &st->nat[0][i], L);
-
-            if (channels == 2) {
-                st->subR += subCoeff * (R - st->subR);
-                float sR = st->subR;
-                float aR = sR < 0.0f ? -sR : sR;
-                float harmR = sR * (0.14f * aR + 0.06f * sR);
-                float dcR = harmR - st->dcInR + dcCoeff * st->dcOutR;
-                st->dcInR = harmR;
-                st->dcOutR = dcR;
-                R += dcR;
-                for (int i = 0; i < 4; i++) R = bq(&fp[FP_NAT_COEF + i * 5], &st->nat[1][i], R);
-            }
-        }
-
-        if (doCf) {
-            st->cfLpL += cfCoeff * (L - st->cfLpL);
-            st->cfLpR += cfCoeff * (R - st->cfLpR);
-            st->delayL[delayWrite] = st->cfLpL;
-            st->delayR[delayWrite] = st->cfLpR;
-            int readIdx = (delayWrite - delaySamples) & 15;
-            delayWrite = (delayWrite + 1) & 15;
-            float delayedLowL = st->delayL[readIdx];
-            float delayedLowR = st->delayR[readIdx];
-            float highL = L - st->cfLpL;
-            float highR = R - st->cfLpR;
-            float outL = L + 0.06f * highL + cfMix * delayedLowR;
-            float outR = R + 0.06f * highR + cfMix * delayedLowL;
+        if (doStage) {
+            /* Запись через разность: при L=R фильтры равны, и выход совпадает с входом побитово */
+            st->stageLpL += stageCoeff * (L - st->stageLpL);
+            st->stageLpR += stageCoeff * (R - st->stageLpR);
+            float outL = L + stageG * (st->stageLpR - st->stageLpL);
+            float outR = R + stageG * (st->stageLpL - st->stageLpR);
             L = outL;
             R = outR;
         }
@@ -383,7 +333,6 @@ JNIEXPORT jint JNICALL Java_com_themoon_y1_managers_ZenyNative_process(JNIEnv *e
         }
     }
 
-    st->delayWrite = delayWrite;
     fp[FP_RUNNING_POWER] = runningPower;
     fp[FP_AGC_GAIN] = agcGain;
     ip[IP_RNG] = (jint)rng;

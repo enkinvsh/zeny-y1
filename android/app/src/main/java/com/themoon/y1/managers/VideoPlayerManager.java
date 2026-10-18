@@ -71,12 +71,9 @@ public class VideoPlayerManager {
             vlcVout.attachViews();
         }
 
-        // 🚀 [화면 꽉 채우기 버그 수정] setWindowSize()를 안 불러주면 VLC가 실제 화면 크기를 몰라서
-        // 원본 해상도 그대로(예: 320x240) 작게 그려버립니다 - SurfaceView가 아직 레이아웃을 마치지
-        // 않았을 수 있으므로 post()로 실제 크기가 잡힌 뒤에 넘겨줍니다.
-        // 🚀 [화면비 옵션] "화면 채우기(Stretch)"가 켜져 있으면 여기서 실제로 잡힌 뷰 크기를 그대로
-        // 목표 비율로 강제해서(letterbox 없이) 화면을 완전히 채웁니다 - 원본이 아니면 비율이 눌리거나
-        // 늘어날 수 있지만, 검은 여백 없이 꽉 채워 보고 싶다는 요청(Issue #7)에 대한 답입니다.
+        // Без setWindowSize() VLC не знает реальный размер окна и рисует видео в исходном
+        // разрешении (например 320x240). SurfaceView мог ещё не пройти layout, поэтому размер
+        // передаём через post(), когда он уже известен. Соотношение сторон оставляем родным.
         surfaceView.post(new Runnable() {
             @Override
             public void run() {
@@ -84,9 +81,7 @@ public class VideoPlayerManager {
                 int h = surfaceView.getHeight();
                 if (w > 0 && h > 0) {
                     vlcVout.setWindowSize(w, h);
-                    boolean stretchFill = MainActivity.instance != null
-                            && MainActivity.instance.prefs.getBoolean("video_stretch_fill", false);
-                    mediaPlayer.setAspectRatio(stretchFill ? (w + ":" + h) : null);
+                    mediaPlayer.setAspectRatio(null);
                 }
             }
         });

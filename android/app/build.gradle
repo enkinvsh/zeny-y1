@@ -2,19 +2,6 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
-// Last.fm credentials are kept out of source control. Register a free API account at
-// https://www.last.fm/api/account/create and add these two lines to your local.properties
-// (which is already gitignored and never committed):
-//   lastfm.api.key=YOUR_KEY
-//   lastfm.api.secret=YOUR_SECRET
-def localProps = new Properties()
-def localPropsFile = rootProject.file("local.properties")
-if (localPropsFile.exists()) {
-    localProps.load(new FileInputStream(localPropsFile))
-}
-def lastFmApiKey = localProps.getProperty("lastfm.api.key", "")
-def lastFmApiSecret = localProps.getProperty("lastfm.api.secret", "")
-
 android {
     namespace 'com.themoon.y1'
     compileSdk 35
@@ -34,8 +21,6 @@ android {
         }
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         multiDexEnabled true
-        buildConfigField "String", "LASTFM_API_KEY", "\"${lastFmApiKey}\""
-        buildConfigField "String", "LASTFM_API_SECRET", "\"${lastFmApiSecret}\""
     }
     buildFeatures {
         buildConfig true

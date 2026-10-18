@@ -32,18 +32,14 @@ public class Bench {
 
     static boolean useNative = true;
 
-    static void bench(String name, int rate, boolean natural, boolean soundCheck, boolean eq) throws Exception {
+    static void bench(String name, int rate, boolean air, boolean soundCheck) throws Exception {
         ZenyAudioProcessor p = new ZenyAudioProcessor();
         p.setNativeEnabled(useNative);
         p.configure(new AudioFormat(rate, 2, C.ENCODING_PCM_FLOAT));
         p.flush();
-        p.setZenyNaturalEnabled(natural);
+        p.setAirStep(air ? 4 : 0);
         p.setSoundCheckEnabled(soundCheck);
         if (soundCheck) p.setTrackGainDb(null);
-        if (eq) {
-            p.setSoftwareEqEnabled(true);
-            for (int b = 0; b < 10; b++) p.setBandLevel(b, (b % 2 == 0) ? 3.0f : -2.0f);
-        }
         float[] in = noise(rate, 10.0);
         // Вход кодируется один раз, чтобы цикл упаковки на Java не попадал в замер
         ByteBuffer all = ByteBuffer.allocateDirect(in.length * 4).order(ByteOrder.nativeOrder());
@@ -60,11 +56,10 @@ public class Bench {
     public static void main(String[] args) throws Exception {
         useNative = args.length == 0 || !"java".equals(args[0]);
         System.out.println("доля одного ядра по проходам 1..4, 10 с аудио; режим " + (useNative ? "native" : "java"));
-        bench("44.1k, без ресемплера, Natural OFF", 44100, false, false, false);
-        bench("48k sinc, Natural OFF", 48000, false, false, false);
-        bench("48k sinc, Natural ON", 48000, true, false, false);
-        bench("48k sinc, Natural ON + AGC", 48000, true, true, false);
-        bench("48k sinc, Natural ON + EQ 10 полос", 48000, true, false, true);
-        bench("47123 Hermite, Natural OFF", 47123, false, false, false);
+        bench("44.1k, без ресемплера, Air 0", 44100, false, false);
+        bench("48k sinc, Air 0", 48000, false, false);
+        bench("48k sinc, Air 4", 48000, true, false);
+        bench("48k sinc, Air 4 + AGC", 48000, true, true);
+        bench("47123 Hermite, Air 0", 47123, false, false);
     }
 }

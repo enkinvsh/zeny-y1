@@ -35,8 +35,6 @@ public class AudioPlayerManager {
     private static AudioPlayerManager instance;
     public SimpleExoPlayer exoPlayer;
     public ZenyAudioProcessor zenyProcessor = new ZenyAudioProcessor();
-    public Y1EqAudioProcessor customEqProcessor = new Y1EqAudioProcessor();
-    public Y1CrossfeedAudioProcessor crossfeedProcessor = new Y1CrossfeedAudioProcessor();
     public MediaPlayer legacyPlayer;
     public boolean isUsingLegacyPlayer = false;
     // 🚀 [FLAC 2단 엔진] 네이티브 legacyPlayer가 재생 도중 특정 FLAC 파일에서 에러를 뱉으면(일부
@@ -50,11 +48,6 @@ public class AudioPlayerManager {
     private java.io.FileInputStream currentFileInputStream;
 
     private float currentSpeed = 1.0f;
-
-    // Metadata for the track currently being prepared, handed to LastFmScrobbler
-    // once its real duration is known (synchronously for the legacy/FLAC player,
-    // or asynchronously at STATE_READY for ExoPlayer).
-    private String pendingScrobbleArtist, pendingScrobbleTitle, pendingScrobbleAlbum, pendingScrobblePath;
 
     private AudioPlayerManager() {}
 
@@ -168,17 +161,12 @@ public class AudioPlayerManager {
                                 @Override
                                 public void run() {
                                     try {
-                                        // 🚀 [버그 완벽 수리] 곡이 바뀌어 오디오 잭이 갱신될 때마다 EQ 설정도 잊지 않고 다시 주입합니다!
-                                        if (AudioEffectManager.getInstance() != null) {
-                                            AudioEffectManager.getInstance().applyAudioEffects();
-                                            AudioEffectManager.getInstance().applyEqProfile(); // 💡 이 한 줄이 추가되어야 소리가 바뀝니다!!
-                                        }
+                                        // Настройки звука заново уходят в процессор на каждый новый трек
+                                        AudioEffectManager.getInstance().applyAudioEffects();
                                         MainActivity.instance.setupVisualizer();
 
                                         int duration = getDuration();
                                         MainActivity.instance.refreshPlayerProgress(getCurrentPosition(), duration);
-                                        com.themoon.y1.managers.LastFmScrobbler.getInstance(MainActivity.instance)
-                                                .onTrackStart(pendingScrobbleArtist, pendingScrobbleTitle, pendingScrobbleAlbum, duration, pendingScrobblePath);
                                         // 🚀 [추가!] 곡 장전이 끝나서 정확한 duration이 나왔으므로, 이 시점에 비트레이트 캡슐을 다시 업데이트합니다!
                                         if (!MainActivity.instance.currentPlaylist.isEmpty()) {
                                             MainActivity.instance.updateAudioQualityInfo(MainActivity.instance.currentPlaylist.get(MainActivity.instance.currentIndex));
@@ -278,10 +266,6 @@ public class AudioPlayerManager {
             @Override
             public void run() {
                 try {
-                    // Track just played to completion - evaluate it for scrobbling before
-                    // any repeat/next logic changes the player's position.
-                    com.themoon.y1.managers.LastFmScrobbler.getInstance(main).evaluateAndMaybeSubmit(getCurrentPosition());
-
                     int repeatMode = main.prefs.getInt("repeat_mode", 0);
                     if (main.consumeEndOfTrackSleep()) {
                         // Следующий трек готовим на паузе, иначе Play после таймера упрётся в
@@ -301,8 +285,6 @@ public class AudioPlayerManager {
                         } else if (exoPlayer != null) {
                             exoPlayer.seekTo(0); exoPlayer.setPlayWhenReady(true);
                         }
-                        // Same track loops again - re-arm it so the next full loop can scrobble too.
-                        com.themoon.y1.managers.LastFmScrobbler.getInstance(main).rearmCurrentTrack();
                     } else if (repeatMode == 2) {
                         nextTrack();
                     } else {
@@ -632,10 +614,6 @@ public class AudioPlayerManager {
         final MainActivity main = MainActivity.instance;
         if (main == null || main.currentPlaylist.isEmpty()) return;
 
-        // The track that's about to be replaced gets one last chance to scrobble,
-        // using its position right before we tear down/reload the player.
-        com.themoon.y1.managers.LastFmScrobbler.getInstance(main).evaluateAndMaybeSubmit(getCurrentPosition());
-
         final File track = main.currentPlaylist.get(index);
         main.lastAlbumArtBytes = null;
         main.currentAlbumColor = ThemeManager.getListButtonFocusedBg() | 0xFF000000;
@@ -790,11 +768,6 @@ public class AudioPlayerManager {
 
             main.tvPlayerAlbum.setText(album != null && !album.trim().isEmpty() ? album.trim() : "");
 
-            // 🚀 Last.fm 스크로블 후보 메타데이터 확정 (실제 duration이 나오는 시점에 onTrackStart 호출됨)
-            pendingScrobbleArtist = a;
-            pendingScrobbleTitle = (t != null && !t.trim().isEmpty()) ? t : safeFileName;
-            pendingScrobbleAlbum = album;
-            pendingScrobblePath = track.getAbsolutePath();
             zenyProcessor.setTrackGainDb(trackGainDb);
 
 
@@ -932,8 +905,6 @@ public class AudioPlayerManager {
 
                 int duration = legacyPlayer.getDuration();
                 main.refreshPlayerProgress(legacyPlayer.getCurrentPosition(), duration);
-                com.themoon.y1.managers.LastFmScrobbler.getInstance(main)
-                        .onTrackStart(pendingScrobbleArtist, pendingScrobbleTitle, pendingScrobbleAlbum, duration, pendingScrobblePath);
 
             } else if (isGaplessQueueActive) {
                 // 🚀 [Gapless 재생] ExoPlayer가 이미 내부 큐에서 이 트랙으로 넘어가 있는 상태입니다 (직접

@@ -612,8 +612,12 @@ public final class ReaderController implements BookListView.Listener {
     // ------------------------------------------------------------------ клавиши
 
     public void onCenter() {
-        if (reading && engine != null) toggle();
-        else list.activate();
+        if (reading && engine != null) {
+            host.click();
+            toggle();
+        } else {
+            list.activate();
+        }
     }
 
     public void onPlayShort() {
@@ -627,7 +631,10 @@ public final class ReaderController implements BookListView.Listener {
         }
         long now = SystemClock.uptimeMillis();
         if (engine.isPlaying()) {
+            int wpmBefore = engine.wpm();
             engine.stepWpm(dir);
+            // На краю диапазона скорость не меняется и щелчка нет, как у списка на последней строке.
+            if (engine.wpm() != wpmBefore) host.click();
             rsvp.setProgress(engine.percent(), ReaderFormat.minutesLeft(engine.remainingMs()), engine.wpm());
             rsvp.showWpmOverlay();
         } else {
@@ -635,6 +642,7 @@ public final class ReaderController implements BookListView.Listener {
             if (ReaderFormat.isFastTurn(now - lastWheelAt)) engine.stepSentence(dir);
             else engine.stepWords(dir);
             afterMove();
+            host.click();
         }
         lastWheelAt = now;
     }
@@ -678,6 +686,7 @@ public final class ReaderController implements BookListView.Listener {
             if (reading && engine != null) {
                 engine.seekRelativeWords(dir * ReaderFormat.seekWords(now - seekDownAt));
                 afterMove();
+                host.click();
             } else if (list.page(dir)) {
                 host.click();
             }
@@ -694,6 +703,7 @@ public final class ReaderController implements BookListView.Listener {
             } else if (!canceled) {
                 engine.stepSentence(dir);
                 afterMove();
+                host.click();
             }
         } else if (!seekActive && !canceled && list.page(dir)) {
             host.click();
