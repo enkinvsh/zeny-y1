@@ -9,6 +9,7 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 SERIAL=0123456789ABCDEF
+[ -x "$ADB" ] || { echo "не найден adb: поставьте brew install --cask android-platform-tools"; exit 1; }
 MODE="${1:-disable}"
 case "$MODE" in
   disable) CMD="pm disable-user --user 0" ;;

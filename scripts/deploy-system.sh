@@ -11,6 +11,7 @@ source "$(dirname "$0")/env.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APK="$ROOT/out/zeny-y1.apk"
 SERIAL=0123456789ABCDEF
+[ -x "$ADB" ] || { echo "не найден adb: поставьте brew install --cask android-platform-tools"; exit 1; }
 ady() { "$ADB" -s "$SERIAL" "$@"; }
 
 [ -f "$APK" ] || { echo "нет $APK, сначала scripts/build-y1.sh"; exit 1; }
