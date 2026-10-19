@@ -7072,11 +7072,11 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 clickFeedback();
-                new AlertDialog.Builder(MainActivity.this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle(t("Clear Cache & Track Info"))
-                        .setMessage(t("Delete all downloaded album covers and saved track information (Title/Artist)?"))
-                        .setPositiveButton(t("Clear"), new DialogInterface.OnClickListener() {
-                            public void onClick(DialogInterface dialog, int which) {
+                showConfirmDialog(t("Clear Cache & Track Info"), null, null,
+                        t("Delete all downloaded album covers and saved track information (Title/Artist)?"),
+                        t("Clear"), FIRE_RED, new Runnable() {
+                            @Override
+                            public void run() {
                                 try {
                                     // 1. 물리적인 이미지 파일(앨범 커버) 삭제
                                     File coverFolder = new File((Y1Paths.SD + "/Y1_Covers"));
@@ -7131,9 +7131,7 @@ public class MainActivity extends Activity {
                                             .show();
                                 }
                             }
-                        })
-                        .setNegativeButton(t("Cancel"), null)
-                        .show();
+                        });
             }
         });
         containerSettingsItems.addView(btnClearCache);
@@ -7155,16 +7153,14 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 clickFeedback();
-                new AlertDialog.Builder(MainActivity.this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle(t("Reset All Settings"))
-                        .setMessage(t("Reset all settings to their default values? This won't delete any music or playlists."))
-                        .setPositiveButton(t("Reset"), new DialogInterface.OnClickListener() {
-                            public void onClick(DialogInterface dialog, int which) {
+                showConfirmDialog(t("Reset All Settings"), null, null,
+                        t("Reset all settings to their default values? This won't delete any music or playlists."),
+                        t("Reset"), FIRE_RED, new Runnable() {
+                            @Override
+                            public void run() {
                                 resetAllAppSettings();
                             }
-                        })
-                        .setNegativeButton(t("Cancel"), null)
-                        .show();
+                        });
             }
         });
         containerSettingsItems.addView(btnResetAll);
@@ -7187,34 +7183,103 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 clickFeedback();
-                new AlertDialog.Builder(MainActivity.this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle(t("Power Off"))
-                        .setMessage(t("Do you want to shut down the device?"))
-                        .setPositiveButton(t("Shut Down"), new DialogInterface.OnClickListener() {
-                            public void onClick(DialogInterface dialog, int which) {
-                                try {
-                                    Process proc = Runtime.getRuntime().exec(new String[] { "su", "-c", "reboot -p" });
-                                    proc.waitFor();
-                                } catch (Exception e) {
-                                    try {
-                                        Intent intent = new Intent("android.intent.action.ACTION_REQUEST_SHUTDOWN");
-                                        intent.putExtra("android.intent.extra.KEY_CONFIRM", false);
-                                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                                        startActivity(intent);
-                                    } catch (Exception ex) {
-                                        Y1Toast.makeText(MainActivity.this,
-                                                t("System security prevents powering off directly from the app."),
-                                                Toast.LENGTH_LONG).show();
-                                    }
-                                }
+                showConfirmDialog(t("Power Off"), null, null,
+                        t("Do you want to shut down the device?"),
+                        t("Shut Down"), FIRE_RED, new Runnable() {
+                            @Override
+                            public void run() {
+                                shutdownDeviceNow();
                             }
-                        })
-                        .setNegativeButton(t("Cancel"), null)
-                        .show();
+                        });
             }
         });
         containerSettingsItems.addView(btnPowerOff);
 
+    }
+
+    /**
+     * Гасит экран в чёрный сразу в UI-потоке и выключает ядро в фоне через root: синхронный waitFor()
+     * в обработчике кнопки подвешивал диалог, а системный ACTION_REQUEST_SHUTDOWN показывал стоковое
+     * окно Android 4.2 и ждал остановки сервисов по 5–10 секунд.
+     *
+     * Дисплей перед reboot -p обязательно усыпляем штатно (KEY_POWER → early suspend): замер на Y1
+     * 2026-10-19 — при живом дисплее ядро в mtkfb_shutdown ждёт DSI engine, 33 тайм-аута по 2 с,
+     * то есть ~66 с чёрного экрана с мёртвыми кнопками; при уснувшем дисплее mtkfb_shutdown занимает
+     * ~50 мс, а сам сон дисплея после KEY_POWER наступает за 0,56–0,63 с.
+     */
+    private void shutdownDeviceNow() {
+        boolean screenOn = true;
+        try {
+            screenOn = ((PowerManager) getSystemService(Context.POWER_SERVICE)).isScreenOn();
+        } catch (Exception ignored) {
+        }
+        // KEY_POWER при уже погашенном экране разбудил бы дисплей — жмём только когда он горит.
+        // На Y1 клавиша 116 приходит с event0 (mtk-kpd); timeout 3 с — чтобы не ждать сна дисплея вечно.
+        final String sleepDisplay = screenOn
+                ? "/system/bin/sendevent /dev/input/event0 1 116 1; /system/bin/sendevent /dev/input/event0 0 0 0; "
+                        + "/system/bin/sendevent /dev/input/event0 1 116 0; /system/bin/sendevent /dev/input/event0 0 0 0; "
+                        + "/system/xbin/busybox timeout 3 cat /sys/power/wait_for_fb_sleep > /dev/null; "
+                : "";
+        try {
+            if (com.themoon.y1.managers.AudioPlayerManager.getInstance().isPlaying()) {
+                com.themoon.y1.managers.AudioPlayerManager.getInstance().playOrPauseMusic();
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            clickPlayer.cooldown();
+        } catch (Exception ignored) {
+        }
+        try {
+            if (layoutLoadingOverlay != null) {
+                styleLoadingOverlay(LOADING_BLACK);
+                if (tvLoadingProgress != null) tvLoadingProgress.setText("");
+                layoutLoadingOverlay.setAlpha(1.0f);
+                layoutLoadingOverlay.setVisibility(View.VISIBLE);
+                layoutLoadingOverlay.bringToFront();
+            }
+        } catch (Exception ignored) {
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    // Даём окну отрисовать чёрный кадр и доиграть щелчок подтверждения до отключения питания.
+                    Thread.sleep(60);
+                } catch (InterruptedException ignored) {
+                }
+                try {
+                    Process proc = Runtime.getRuntime().exec(new String[] {
+                            "/system/xbin/su", "-c",
+                            sleepDisplay + "/system/bin/sync; /system/bin/reboot -p || /system/xbin/poweroff -f || /system/bin/setprop sys.powerctl shutdown"
+                    });
+                    proc.waitFor();
+                    return;
+                } catch (Exception ignored) {
+                }
+                try {
+                    Process proc = Runtime.getRuntime().exec(new String[] { "su", "-c", "reboot -p" });
+                    proc.waitFor();
+                    return;
+                } catch (Exception ignored) {
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            Intent intent = new Intent("android.intent.action.ACTION_REQUEST_SHUTDOWN");
+                            intent.putExtra("android.intent.extra.KEY_CONFIRM", false);
+                            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            startActivity(intent);
+                        } catch (Exception ex) {
+                            Y1Toast.makeText(MainActivity.this,
+                                    t("System security prevents powering off directly from the app."),
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    }
+                });
+            }
+        }, "zeny-shutdown").start();
     }
 
       // 💡 [신규 추가] 언어팩 선택 전용 화면
@@ -13112,22 +13177,20 @@ public class MainActivity extends Activity {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
                 clickFeedback();
                 if (isServerRunning) {
-                    new AlertDialog.Builder(MainActivity.this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                            .setTitle(t("Server is Running"))
-                            .setMessage(
-                                    t("The Web Server is still active. Do you want to shut it down completely and exit?"))
-                            .setPositiveButton(t("Stop Server"), new DialogInterface.OnClickListener() {
-                                public void onClick(DialogInterface dialog, int which) {
+                    showConfirmDialog(t("Server is Running"), null, null,
+                            t("The Web Server is still active. Do you want to shut it down completely and exit?"),
+                            t("Keep Running"), new Runnable() {
+                                @Override
+                                public void run() {
+                                    changeScreen(backTargetForUtility);
+                                }
+                            }, t("Stop Server"), FIRE_RED, new Runnable() {
+                                @Override
+                                public void run() {
                                     toggleWebServer();
-                                    changeScreen(backTargetForUtility); // 🚀 복귀!
+                                    changeScreen(backTargetForUtility);
                                 }
-                            })
-                            .setNegativeButton(t("Keep Running"), new DialogInterface.OnClickListener() {
-                                public void onClick(DialogInterface dialog, int which) {
-                                    changeScreen(backTargetForUtility); // 🚀 복귀!
-                                }
-                            })
-                            .show();
+                            });
                 } else {
                     cancelWebServerStart();
                     changeScreen(backTargetForUtility); // 🚀 복귀!
@@ -16108,6 +16171,11 @@ public class MainActivity extends Activity {
      */
     private void showConfirmDialog(String title, String name, String artist, String note, String confirmLabel,
             int confirmColor, final Runnable onConfirm) {
+        showConfirmDialog(title, name, artist, note, t("Cancel"), null, confirmLabel, confirmColor, onConfirm);
+    }
+
+    private void showConfirmDialog(String title, String name, String artist, String note, String cancelLabel,
+            final Runnable onCancel, String confirmLabel, int confirmColor, final Runnable onConfirm) {
         ScrollView scrollView = new ScrollView(this);
         scrollView.setBackgroundColor(0xFFFFFFFF);
         final LinearLayout layout = new LinearLayout(this);
@@ -16122,18 +16190,23 @@ public class MainActivity extends Activity {
         int primary = ThemeManager.getTextColorPrimary();
         int muted = ThemeManager.getTextColorSecondary();
         layout.addView(newDialogText(title, 17f, ThemeManager.getCustomFontTitle(), primary));
-        layout.addView(newDialogText(name, 15f, ThemeManager.getCustomFontBold(), primary));
+        if (name != null && !name.isEmpty()) {
+            layout.addView(newDialogText(name, 15f, ThemeManager.getCustomFontBold(), primary));
+        }
         if (artist != null && !artist.isEmpty()) {
             layout.addView(newDialogText(artist, 13f, ThemeManager.getCustomFont(), muted));
         }
-        layout.addView(newDialogText(note, 13f, ThemeManager.getCustomFont(), muted));
+        if (note != null && !note.isEmpty()) {
+            layout.addView(newDialogText(note, 13f, ThemeManager.getCustomFont(), muted));
+        }
 
         View.OnKeyListener wheel = newDialogWheelListener(layout);
-        final View btnCancel = createListButtonWithIcon("", t("Cancel"));
+        final View btnCancel = createListButtonWithIcon("", cancelLabel);
         btnCancel.setOnKeyListener(wheel);
         btnCancel.setOnClickListener(v -> {
             clickFeedback();
             dialog.dismiss();
+            if (onCancel != null) onCancel.run();
         });
         layout.addView(btnCancel);
 
@@ -16730,12 +16803,12 @@ public class MainActivity extends Activity {
 
     // 🚀 [보너스] 즐겨찾기(Favorites) 내부에서도 꾹 누르면 바로 해제할 수 있는 전용 팝업!
     public void showRemoveFromFavoritesDialog(final File songFile) {
-        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle(t("Remove from Favorites"))
-                .setMessage(t("Remove this song from your favorites list?"))
-                .setPositiveButton(t("Remove"), new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface dialog, int which) {
-                        clickFeedback();
+        String[] tags = trackDisplayTags(songFile);
+        showConfirmDialog(t("Remove from Favorites"), tags[0], tags[1],
+                t("Remove this song from your favorites list?"),
+                t("Remove"), FIRE_RED, new Runnable() {
+                    @Override
+                    public void run() {
                         if (favoritePaths.contains(songFile.getAbsolutePath())) {
                             favoritePaths.remove(songFile.getAbsolutePath());
                             try {
@@ -16747,9 +16820,7 @@ public class MainActivity extends Activity {
                                     .show();
                         }
                     }
-                })
-                .setNegativeButton(t("Cancel"), null)
-                .show();
+                });
     }
 
     public void updateAudioQualityInfo(File audioFile) {
@@ -17431,13 +17502,11 @@ public class MainActivity extends Activity {
                         clickFeedback();
                         isLongPressConsumed = true; // 손 뗄 때 클릭되는 안드로이드 고질병 방어막
 
-                        new AlertDialog.Builder(MainActivity.this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                                .setTitle(t("Delete Channel"))
-                                .setMessage(String.format(Locale.US,
-                                        t("Remove %.1f MHz from saved channels?"), freq))
-                                .setPositiveButton(t("Delete"), new DialogInterface.OnClickListener() {
-                                    public void onClick(DialogInterface dialog, int which) {
-                                        clickFeedback();
+                        showConfirmDialog(t("Delete Channel"), String.format(Locale.US, "%.1f MHz", freq), null,
+                                String.format(Locale.US, t("Remove %.1f MHz from saved channels?"), freq),
+                                t("Delete"), FIRE_RED, new Runnable() {
+                                    @Override
+                                    public void run() {
                                         savedRadioStations.remove(freq); // 리스트에서 삭제
 
                                         // 💡 금고(SharedPreferences) 동기화 업데이트
@@ -17453,9 +17522,7 @@ public class MainActivity extends Activity {
 
                                         buildRadioSavedChannelsUI(); // 리스트 갱신 (지운 항목 화면에서 즉시 증발)
                                     }
-                                })
-                                .setNegativeButton(t("Cancel"), null)
-                                .show();
+                                });
                         return true;
                     }
                 });

@@ -13,18 +13,29 @@ import android.util.Log;
 import com.themoon.y1.managers.ClickSynth.ClickKind;
 import com.themoon.y1.managers.ClickSynth.ClickVariant;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Проигрывает щелчки колеса из {@link ClickSynth}. Два статических AudioTrack (шаг и нажатие) на
- * текущий вариант и уровень, один отдельный поток. Дорожка идёт в STREAM_MUSIC: AudioFlinger сам
- * смешивает её с музыкой, фокус не берётся, ExoPlayer не приглушается и не ставится на паузу.
+ * Проигрывает щелчки колеса из {@link ClickSynth}. Карусель из готовых статических AudioTrack (4 на
+ * шаг и 2 на нажатие) на текущий вариант и уровень, один отдельный поток. Дорожка идёт в
+ * STREAM_MUSIC: AudioFlinger сам смешивает её с музыкой, фокус не берётся, ExoPlayer не
+ * приглушается и не ставится на паузу.
  *
  * <p>Задержка щелчка складывается из очереди микшера (кадр 1024 отсчёта, 23 мс), буфера драйвера и
  * пробуждения железа: на этой прошивке звук уходит в standby через 3 с тишины, и первый щелчок после
- * паузы ждёт включения кодека. Поэтому: (1) дорожка заранее взведена (stop и reloadStaticData сделаны
- * после прошлого щелчка), и на горячем пути остаётся один play(); (2) на окно {@link #WARM_MS} после
- * действий пользователя включается беззвучная зацикленная дорожка, она не даёт железу уснуть между
- * щелчками. Окно короткое и привязано к активности, в простое батарею не ест.
+ * паузы ждёт включения кодека. Поэтому: (1) для шага колеса держим карусель из {@link #STEP_POOL_SIZE}
+ * независимых статических дорожек — каждый щелчок запускает уже взведённую дорожку одним play();
+ * (2) на окно {@link #WARM_MS} после действий пользователя включается беззвучная зацикленная дорожка,
+ * она не даёт железу уснуть между щелчками. Окно короткое и привязано к активности, в простое батарею
+ * не ест.
+ *
+ * <p>Взвод (stop()+reloadStaticData()) безопасен только для дорожки, которую AudioFlinger уже убрал из
+ * активных. Отыгравшая статическая дорожка остаётся в микшере ещё на задержку HAL (~92 мс на Y1) плюс
+ * пару циклов микшера. Если взвести её раньше, микшер Android 4.2 доигрывает свежий буфер остановленной
+ * дорожки (лишний щелчок через ~100 мс), а при выбросе из активных обнуляет его — следующий play() на
+ * «взведённой» дорожке молчит. Отсюда симптом «щелчка нет, потом два подряд». Поэтому взвод ждёт
+ * {@link #rearmDelayMs}, а при нехватке взведённых дорожек щелчок пропускается, но живой буфер не
+ * трогаем.
  *
  * <p>Вся работа с AudioTrack идёт только в потоке "zeny-click"; из остальных потоков вызываются
  * лишь методы, которые кладут сообщение в очередь.
@@ -35,10 +46,17 @@ public final class ClickPlayer {
     private static final int MSG_PRESS = 2;
     private static final int MSG_CONFIG = 3;
     private static final int MSG_RELEASE = 4;
-    private static final int MSG_REARM_STEP = 5;
-    private static final int MSG_REARM_PRESS = 6;
     private static final int MSG_WARM_START = 7;
     private static final int MSG_WARM_STOP = 8;
+    private static final int MSG_REARM_STEP_BASE = 10;
+    private static final int MSG_REARM_PRESS_BASE = 20;
+
+    // Дорожка возвращается в строй через ~300 мс (см. rearmDelayMs): восемь дорожек держат прокрутку
+    // до ~25 шагов/с, быстрее UI-поток Y1 шаги всё равно не отдаёт (40–75 мс на шаг по замеру).
+    private static final int STEP_POOL_SIZE = 8;
+    private static final int PRESS_POOL_SIZE = 3;
+    // Не даём очереди расти бесконечно при лаге binder, но сохраняем парные тики быстрой прокрутки.
+    private static final int MAX_PENDING_STEPS = 3;
 
     // Колесо крутят до 20 шагов в секунду. Щелчок следующего шага ближе 70 мс обрывает хвост
     // предыдущего, и на полной громкости это даёт очередь, а не отдельные тики.
@@ -48,28 +66,37 @@ public final class ClickPlayer {
     // Окно, в котором железо удерживается от standby (штатный таймаут 3 с). Восемь секунд покрывают паузу
     // между прокрутками меню и при этом заметно короче, чем «вечно».
     private static final long WARM_MS = 8000;
-    // Дорожка взводится заново после доигрывания щелчка плюс запас на микшер и буфер драйвера: раньше
-    // stop() мог бы обрубить щелчок, который микшер ещё не успел забрать.
-    private static final long REARM_MARGIN_MS = 80;
+    // AudioFlinger убирает отыгравшую статическую дорожку через задержку HAL после первого недобора.
+    // Две задержки HAL плюс 100 мс на циклы микшера и опоздание потока — с запасом; меньше 250 мс не
+    // берём, даже если платформа занижает задержку.
+    private static final long MIN_REARM_MS = 250;
+    private static final long REARM_EXTRA_MS = 100;
+    private static final int FALLBACK_LATENCY_MS = 100;
     private static final int WARM_FRAMES = 2048;
 
     private volatile Handler handler;
     private HandlerThread thread;
     private boolean released;
+    private final AtomicInteger pendingSteps = new AtomicInteger();
 
     // Ниже поля потока "zeny-click".
     private ClickVariant variant = ClickVariant.OFF;
     private int level = 2;
     private boolean dirty;
     private boolean disabled;
-    private AudioTrack stepTrack;
-    private AudioTrack pressTrack;
+    private final AudioTrack[] stepTracks = new AudioTrack[STEP_POOL_SIZE];
+    private final AudioTrack[] pressTracks = new AudioTrack[PRESS_POOL_SIZE];
+    private final boolean[] armedStep = new boolean[STEP_POOL_SIZE];
+    private final boolean[] armedPress = new boolean[PRESS_POOL_SIZE];
+    private int nextStepSlot;
+    private int nextPressSlot;
     private AudioTrack warmTrack;
     private boolean warmPlaying;
-    private boolean armedStep;
-    private boolean armedPress;
     private long stepMs;
     private long pressMs;
+    private long rearmStepMs;
+    private long rearmPressMs;
+    private int builtFrames;
     private int sampleRate;
     private long lastPlayMs;
     private boolean latencyLogged;
@@ -82,13 +109,20 @@ public final class ClickPlayer {
         h.sendMessage(h.obtainMessage(MSG_CONFIG, v.ordinal(), newLevel));
     }
 
-    /** Щелчок текущего варианта. Если такой же щелчок ещё ждёт в очереди, новый не ставится. */
+    /** Щелчок текущего варианта. До {@link #MAX_PENDING_STEPS} шагов подряд сохраняются в очереди без потерь. */
     public void play(ClickKind kind) {
         Handler h = ensureStarted();
         if (h == null) return;
-        int what = kind == ClickKind.STEP ? MSG_STEP : MSG_PRESS;
-        if (h.hasMessages(what)) return;
-        h.sendMessage(h.obtainMessage(what));
+        if (kind == ClickKind.STEP) {
+            if (pendingSteps.get() >= MAX_PENDING_STEPS) return;
+            pendingSteps.incrementAndGet();
+            if (!h.sendMessage(h.obtainMessage(MSG_STEP))) {
+                pendingSteps.decrementAndGet();
+            }
+        } else {
+            if (h.hasMessages(MSG_PRESS)) return;
+            h.sendMessage(h.obtainMessage(MSG_PRESS));
+        }
     }
 
     /** Пользователь вот-вот начнёт крутить колесо (экран включён, разблокировка): будим железо заранее. */
@@ -115,15 +149,24 @@ public final class ClickPlayer {
         Handler h = ensureStarted();
         if (h == null) return;
         h.removeMessages(MSG_STEP);
+        pendingSteps.set(0);
         h.removeMessages(MSG_PRESS);
         h.removeMessages(MSG_CONFIG);
         h.sendMessage(h.obtainMessage(MSG_CONFIG, v.ordinal(), previewLevel));
-        h.sendMessage(h.obtainMessage(kind == ClickKind.STEP ? MSG_STEP : MSG_PRESS));
+        if (kind == ClickKind.STEP) {
+            pendingSteps.incrementAndGet();
+            if (!h.sendMessage(h.obtainMessage(MSG_STEP))) {
+                pendingSteps.decrementAndGet();
+            }
+        } else {
+            h.sendMessage(h.obtainMessage(MSG_PRESS));
+        }
     }
 
     /** Освобождает дорожки и останавливает поток; после вызова все методы молча ничего не делают. */
     public synchronized void release() {
         released = true;
+        pendingSteps.set(0);
         if (handler == null) return;
         handler.removeCallbacksAndMessages(null);
         handler.sendMessage(handler.obtainMessage(MSG_RELEASE));
@@ -148,13 +191,23 @@ public final class ClickPlayer {
     }
 
     private void onMessage(Message msg) {
+        if (msg.what >= MSG_REARM_STEP_BASE && msg.what < MSG_REARM_STEP_BASE + STEP_POOL_SIZE) {
+            int slot = msg.what - MSG_REARM_STEP_BASE;
+            armedStep[slot] = rearm(stepTracks[slot]);
+            return;
+        }
+        if (msg.what >= MSG_REARM_PRESS_BASE && msg.what < MSG_REARM_PRESS_BASE + PRESS_POOL_SIZE) {
+            int slot = msg.what - MSG_REARM_PRESS_BASE;
+            armedPress[slot] = rearm(pressTracks[slot]);
+            return;
+        }
         switch (msg.what) {
             case MSG_CONFIG:
                 ClickVariant wanted = ClickVariant.values()[msg.arg1];
-                // Тот же вариант и уровень не пересобираем: создание двух AudioTrack это вызовы binder в
+                // Тот же вариант и уровень не пересобираем: создание дорожек это вызовы binder в
                 // AudioFlinger, и предпрослушивание отставало бы от настоящего щелчка с готовыми дорожками.
                 if (wanted == variant && msg.arg2 == level && !dirty
-                        && (disabled || stepTrack != null || !wanted.isRendered())) {
+                        && (disabled || stepTracks[0] != null || !wanted.isRendered())) {
                     break;
                 }
                 variant = wanted;
@@ -163,16 +216,11 @@ public final class ClickPlayer {
                 rebuildIfNeeded();
                 break;
             case MSG_STEP:
+                if (pendingSteps.decrementAndGet() < 0) pendingSteps.set(0);
                 playTrack(ClickKind.STEP);
                 break;
             case MSG_PRESS:
                 playTrack(ClickKind.PRESS);
-                break;
-            case MSG_REARM_STEP:
-                armedStep = rearm(stepTrack);
-                break;
-            case MSG_REARM_PRESS:
-                armedPress = rearm(pressTrack);
                 break;
             case MSG_WARM_START:
                 startWarm();
@@ -196,21 +244,33 @@ public final class ClickPlayer {
         releaseTracks();
         if (disabled || !variant.isRendered()) return;
         if (sampleRate == 0) sampleRate = nativeSampleRate();
+        boolean ok = true;
         try {
             short[] step = ClickSynth.render(variant, ClickKind.STEP, level, sampleRate);
             short[] press = ClickSynth.render(variant, ClickKind.PRESS, level, sampleRate);
             stepMs = step.length * 1000L / sampleRate;
             pressMs = press.length * 1000L / sampleRate;
-            stepTrack = buildTrack(step);
-            pressTrack = buildTrack(press);
+            int latencyMs = outputLatencyMs();
+            for (int i = 0; i < STEP_POOL_SIZE; i++) {
+                stepTracks[i] = buildTrack(step);
+                armedStep[i] = stepTracks[i] != null;
+                if (stepTracks[i] == null) ok = false;
+            }
+            // Считаем по фактической длине буфера: прошивка могла добить его тишиной до минимума.
+            rearmStepMs = rearmDelayMs(builtFrames * 1000L / sampleRate, latencyMs);
+            for (int i = 0; i < PRESS_POOL_SIZE; i++) {
+                pressTracks[i] = buildTrack(press);
+                armedPress[i] = pressTracks[i] != null;
+                if (pressTracks[i] == null) ok = false;
+            }
+            rearmPressMs = rearmDelayMs(builtFrames * 1000L / sampleRate, latencyMs);
+            nextStepSlot = 0;
+            nextPressSlot = 0;
         } catch (RuntimeException e) {
-            stepTrack = null;
-            pressTrack = null;
+            ok = false;
         }
-        // Свежая статическая дорожка уже стоит на нуле, взводить её не нужно.
-        armedStep = true;
-        armedPress = true;
-        if (stepTrack == null || pressTrack == null) {
+        if (!ok) {
+            releaseTracks();
             disable("AudioTrack is not initialized");
         } else {
             logLatencyOnce();
@@ -221,47 +281,72 @@ public final class ClickPlayer {
         if (disabled) return;
         rebuildIfNeeded();
         boolean step = kind == ClickKind.STEP;
-        AudioTrack track = step ? stepTrack : pressTrack;
-        if (track == null) return;
+        AudioTrack[] pool = step ? stepTracks : pressTracks;
+        boolean[] armedPool = step ? armedStep : armedPress;
+        int start = step ? nextStepSlot : nextPressSlot;
+        int slot = -1;
+        for (int i = 0; i < pool.length; i++) {
+            int candidate = (start + i) % pool.length;
+            if (pool[candidate] != null && armedPool[candidate]) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (slot < 0) {
+            // Все дорожки ещё в микшере: лучше пропустить один тик сверхбыстрой прокрутки, чем
+            // перевзвести живую дорожку и получить тишину сейчас и лишний щелчок позже.
+            startWarm();
+            return;
+        }
+        if (step) nextStepSlot = (slot + 1) % pool.length;
+        else nextPressSlot = (slot + 1) % pool.length;
+        AudioTrack track = pool[slot];
         long now = SystemClock.uptimeMillis();
         float volume = now - lastPlayMs < FAST_SPIN_MS ? FAST_SPIN_VOLUME : 1.0f;
         lastPlayMs = now;
-        boolean played = tryPlay(track, volume, step ? armedStep : armedPress);
+        boolean played = tryPlay(track, volume);
         if (!played) {
             // Один пересбор на случай, когда AudioFlinger убил дорожку (например после смены аудиоустройства).
             dirty = true;
             rebuildIfNeeded();
-            track = step ? stepTrack : pressTrack;
-            played = !disabled && track != null && tryPlay(track, volume, true);
+            slot = 0;
+            if (step) {
+                nextStepSlot = 1 % STEP_POOL_SIZE;
+                track = stepTracks[0];
+            } else {
+                nextPressSlot = 1 % PRESS_POOL_SIZE;
+                track = pressTracks[0];
+            }
+            played = !disabled && track != null && tryPlay(track, volume);
             if (!played) {
                 disable("playback failed twice");
                 return;
             }
         }
-        if (step) armedStep = false;
-        else armedPress = false;
-        // Всё, что не нужно для звука, идёт после play(): взвод дорожки и продление окна прогрева.
+        if (step) armedStep[slot] = false;
+        else armedPress[slot] = false;
+        // Всё, что не нужно для звука, идёт после play(): взвод использованного слота и продление окна прогрева.
         Handler h = handler;
         if (h != null) {
-            int what = step ? MSG_REARM_STEP : MSG_REARM_PRESS;
+            int what = (step ? MSG_REARM_STEP_BASE : MSG_REARM_PRESS_BASE) + slot;
             h.removeMessages(what);
-            h.sendMessageDelayed(h.obtainMessage(what), (step ? stepMs : pressMs) + REARM_MARGIN_MS);
+            h.sendMessageDelayed(h.obtainMessage(what), step ? rearmStepMs : rearmPressMs);
         }
         startWarm();
     }
 
-    private boolean tryPlay(AudioTrack track, float volume, boolean armed) {
+    private boolean tryPlay(AudioTrack track, float volume) {
         try {
-            if (!armed) {
-                track.stop();
-                track.reloadStaticData();
-            }
             track.setStereoVolume(volume, volume);
             track.play();
             return true;
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    private static long rearmDelayMs(long clickMs, int latencyMs) {
+        return Math.max(MIN_REARM_MS, clickMs + 2L * latencyMs + REARM_EXTRA_MS);
     }
 
     // Возвращает true, если дорожка стоит на нуле и следующий щелчок обойдётся одним play().
@@ -328,18 +413,24 @@ public final class ClickPlayer {
     }
 
     // Задержка выходного потока в логе один раз за сборку дорожек: по ней видно, чего ждать от платформы.
-    // Метод скрытый, поэтому через рефлексию; не вышло, значит строки в логе не будет, и всё.
     private void logLatencyOnce() {
         if (latencyLogged) return;
         latencyLogged = true;
+        Log.i(TAG, "variant=" + variant.id() + " rate=" + sampleRate + " step=" + stepMs + "ms press=" + pressMs
+                + "ms hal output latency=" + outputLatencyMs() + "ms rearm=" + rearmStepMs + "/" + rearmPressMs + "ms");
+    }
+
+    // AudioSystem.getOutputLatency скрыт в SDK, поэтому через рефлексию. Это та же задержка HAL, по
+    // которой AudioFlinger решает, когда выкинуть отыгравшую дорожку из микшера.
+    private static int outputLatencyMs() {
         try {
             Object ms = Class.forName("android.media.AudioSystem")
                     .getMethod("getOutputLatency", int.class).invoke(null, AudioManager.STREAM_MUSIC);
-            Log.i(TAG, "variant=" + variant.id() + " rate=" + sampleRate + " step=" + stepMs + "ms press=" + pressMs
-                    + "ms hal output latency=" + ms + "ms");
+            if (ms instanceof Integer && (Integer) ms > 0 && (Integer) ms < 1000) return (Integer) ms;
         } catch (Exception e) {
-            Log.i(TAG, "variant=" + variant.id() + " rate=" + sampleRate + " (output latency unavailable)");
+            // скрытого метода нет: берём запасную оценку
         }
+        return FALLBACK_LATENCY_MS;
     }
 
     private AudioTrack buildTrack(short[] pcm) {
@@ -363,6 +454,7 @@ public final class ClickPlayer {
             // INITIALIZED до записи отвергала каждую дорожку, и щелчок молчал на любом устройстве.
             if (track.getState() != AudioTrack.STATE_UNINITIALIZED && track.write(data, 0, data.length) > 0
                     && track.getState() == AudioTrack.STATE_INITIALIZED) {
+                builtFrames = data.length;
                 return track;
             }
         } catch (RuntimeException e) {
@@ -379,10 +471,18 @@ public final class ClickPlayer {
     }
 
     private void releaseTracks() {
-        releaseQuietly(stepTrack);
-        releaseQuietly(pressTrack);
-        stepTrack = null;
-        pressTrack = null;
+        for (int i = 0; i < STEP_POOL_SIZE; i++) {
+            if (handler != null) handler.removeMessages(MSG_REARM_STEP_BASE + i);
+            releaseQuietly(stepTracks[i]);
+            stepTracks[i] = null;
+            armedStep[i] = false;
+        }
+        for (int i = 0; i < PRESS_POOL_SIZE; i++) {
+            if (handler != null) handler.removeMessages(MSG_REARM_PRESS_BASE + i);
+            releaseQuietly(pressTracks[i]);
+            pressTracks[i] = null;
+            armedPress[i] = false;
+        }
     }
 
     // Дорожка прогрева живёт отдельно от щелчков: смена варианта при предпрослушивании её не трогает.

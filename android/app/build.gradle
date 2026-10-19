@@ -12,7 +12,7 @@ android {
         targetSdk 35
         // Дев-сборки подставляют растущий versionCode (-Py1.vc), иначе встроенные темы/языки не переустановятся на SD
         versionCode Integer.parseInt((project.findProperty('y1.vc') ?: '145').toString())
-        versionName "1.2.0"
+        versionName "1.2.1"
 // 🚀 [용량 방어막 추가] 상자에서 젤리빈(32비트) 부품 딱 하나만 쏙 빼서 APK에 담아라!
         // Y1 (MT6572) 32-битный: для плеера всегда armeabi-v7a. Для эмулятора на Apple Silicon
         // (64-бит only) собираем с -Py1.abi=arm64-v8a, иначе INSTALL_FAILED_NO_MATCHING_ABIS.
